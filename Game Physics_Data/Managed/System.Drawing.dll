@@ -1,0 +1,5246 @@
+Array.slice(arguments, 0, arguments.length - 1);
+      var keepAlivePromise = requireAsync('keep_alive').then(function(module) {
+        return module.createKeepAlive();
+      });
+      $Function.apply(customizedFunction, this, args).then(function(result) {
+        if (callback) {
+          exceptionHandler.safeCallbackApply(name, {'stack': stack}, callback,
+                                             [result]);
+        }
+      }).catch(function(error) {
+        if (callback) {
+          var message = exceptionHandler.safeErrorToString(error, true);
+          lastError.run(name, message, stack, callback);
+        }
+      }).then(function() {
+        keepAlivePromise.then(function(keepAlive) {
+          keepAlive.close();
+        });
+      });
+    });
+};
+
+APIFunctions.prototype.setUpdateArgumentsPostValidate =
+    function(apiName, customizedFunction) {
+  return this.setHook_(
+    apiName, 'updateArgumentsPostValidate', customizedFunction);
+};
+
+APIFunctions.prototype.setUpdateArgumentsPreValidate =
+    function(apiName, customizedFunction) {
+  return this.setHook_(
+    apiName, 'updateArgumentsPreValidate', customizedFunction);
+};
+
+APIFunctions.prototype.setCustomCallback =
+    function(apiName, customizedFunction) {
+  return this.setHook_(apiName, 'customCallback', customizedFunction);
+};
+
+// Get the platform from navigator.appVersion.
+function getPlatform() {
+  var platforms = [
+    [/CrOS Touch/, "chromeos touch"],
+    [/CrOS/, "chromeos"],
+    [/Linux/, "linux"],
+    [/Mac/, "mac"],
+    [/Win/, "win"],
+  ];
+
+  for (var i = 0; i < platforms.length; i++) {
+    if ($RegExp.exec(platforms[i][0], navigator.appVersion)) {
+      return platforms[i][1];
+    }
+  }
+  return "unknown";
+}
+
+function isPlatformSupported(schemaNode, platform) {
+  return !schemaNode.platforms ||
+      $Array.indexOf(schemaNode.platforms, platform) > -1;
+}
+
+function isManifestVersionSupported(schemaNode, manifestVersion) {
+  return !schemaNode.maximumManifestVersion ||
+      manifestVersion <= schemaNode.maximumManifestVersion;
+}
+
+function isSchemaNodeSupported(schemaNode, platform, manifestVersion) {
+  return isPlatformSupported(schemaNode, platform) &&
+      isManifestVersionSupported(schemaNode, manifestVersion);
+}
+
+function createCustomType(type) {
+  var jsModuleName = type.js_module;
+  logging.CHECK(jsModuleName, 'Custom type ' + type.id +
+                ' has no "js_module" property.');
+  // This list contains all types that has a js_module property. It is ugly to
+  // hard-code them here, but the number of APIs that use js_module has not
+  // changed since the introduction of js_modules in crbug.com/222156.
+  // This whitelist serves as an extra line of defence to avoid exposing
+  // arbitrary extension modules when the |type| definition is poisoned.
+  var whitelistedModules = [
+    'ChromeDirectSetting',
+    'ChromeSetting',
+    'ContentSetting',
+    'StorageArea',
+  ];
+  logging.CHECK($Array.indexOf(whitelistedModules, jsModuleName) !== -1,
+                'Module ' + jsModuleName + ' does not define a custom type.');
+  var jsModule = require(jsModuleName);
+  logging.CHECK(jsModule, 'No module ' + jsModuleName + ' found for ' +
+                type.id + '.');
+  var customType = jsModule[jsModuleName];
+  logging.CHECK(customType, jsModuleName + ' must export itself.');
+  return customType;
+}
+
+var platform = getPlatform();
+
+function Binding(apiName) {
+  this.apiName_ = apiName;
+  this.apiFunctions_ = new APIFunctions(apiName);
+  this.customHooks_ = [];
+};
+
+$Object.defineProperty(Binding, 'create', {
+  __proto__: null,
+  configurable: false,
+  enumerable: false,
+  value: function(apiName) { return new Binding(apiName); },
+  writable: false,
+});
+
+Binding.prototype = {
+  // Sneaky workaround for Object.prototype getters/setters - our prototype
+  // isn't Object.prototype. SafeBuiltins (e.g. $Object.hasOwnProperty())
+  // should still work.
+  __proto__: null,
+
+  // Forward-declare properties.
+  apiName_: undefined,
+  apiFunctions_: undefined,
+  customEvent_: undefined,
+  customHooks_: undefined,
+
+  // The API through which the ${api_name}_custom_bindings.js files customize
+  // their API bindings beyond what can be generated.
+  //
+  // There are 2 types of customizations available: those which are required in
+  // order to do the schema generation (registerCustomEvent and
+  // registerCustomType), and those which can only run after the bindings have
+  // been generated (registerCustomHook).
+
+  // Registers a custom event type for the API identified by |namespace|.
+  // |event| is the event's constructor.
+  registerCustomEvent: function(event) {
+    this.customEvent_ = event;
+  },
+
+  // Registers a function |hook| to run after the schema for all APIs has been
+  // generated.  The hook is passed as its first argument an "API" object to
+  // interact with, and second the current extension ID. See where
+  // |customHooks| is used.
+  registerCustomHook: function(fn) {
+    $Array.push(this.customHooks_, fn);
+  },
+
+  // TODO(kalman/cduvall): Refactor this so |runHooks_| is not needed.
+  runHooks_: function(api, schema) {
+    $Array.forEach(this.customHooks_, function(hook) {
+      if (!isSchemaNodeSupported(schema, platform, manifestVersion))
+        return;
+
+      if (!hook)
+        return;
+
+      hook({
+        __proto__: null,
+        apiFunctions: this.apiFunctions_,
+        schema: schema,
+        compiledApi: api
+      }, extensionId, contextType);
+    }, this);
+  },
+
+  // Generates the bindings from the schema for |this.apiName_| and integrates
+  // any custom bindings that might be present.
+  generate: function() {
+    // NB: It's important to load the schema during generation rather than
+    // setting it beforehand so that we're more confident the schema we're
+    // loading is real, and not one that was injected by a page intercepting
+    // Binding.generate.
+    // Additionally, since the schema is an object returned from a native
+    // handler, its properties don't have the custom getters/setters that a page
+    // may have put on Object.prototype, and the object is frozen by v8.
+    var schema = schemaRegistry.GetSchema(this.apiName_);
+
+    function shouldCheckUnprivileged() {
+      var shouldCheck = 'unprivileged' in schema;
+      if (shouldCheck)
+        return shouldCheck;
+
+      $Array.forEach(['functions', 'events'], function(type) {
+        if ($Object.hasOwnProperty(schema, type)) {
+          $Array.forEach(schema[type], function(node) {
+            if ('unprivileged' in node)
+              shouldCheck = true;
+          });
+        }
+      });
+      if (shouldCheck)
+        return shouldCheck;
+
+      for (var property in schema.properties) {
+        if ($Object.hasOwnProperty(schema, property) &&
+            'unprivileged' in schema.properties[property]) {
+          shouldCheck = true;
+          break;
+        }
+      }
+      return shouldCheck;
+    }
+    var checkUnprivileged = shouldCheckUnprivileged();
+
+    // TODO(kalman/cduvall): Make GetAvailability handle this, then delete the
+    // supporting code.
+    if (!isSchemaNodeSupported(schema, platform, manifestVersion)) {
+      console.error('chrome.' + schema.namespace + ' is not supported on ' +
+                    'this platform or manifest version');
+      return undefined;
+    }
+
+    var mod = {};
+
+    var namespaces = $String.split(schema.namespace, '.');
+    for (var index = 0, name; name = namespaces[index]; index++) {
+      mod[name] = mod[name] || {};
+      mod = mod[name];
+    }
+
+    if (schema.types) {
+      $Array.forEach(schema.types, function(t) {
+        if (!isSchemaNodeSupported(t, platform, manifestVersion))
+          return;
+
+        // Add types to global schemaValidator; the types we depend on from
+        // other namespaces will be added as needed.
+        schemaUtils.schemaValidator.addTypes(t);
+
+        // Generate symbols for enums.
+        var enumValues = t['enum'];
+        if (enumValues) {
+          // Type IDs are qualified with the namespace during compilation,
+          // unfortunately, so remove it here.
+          logging.DCHECK($String.substr(t.id, 0, schema.namespace.length) ==
+                             schema.namespace);
+          // Note: + 1 because it ends in a '.', e.g., 'fooApi.Type'.
+          var id = $String.substr(t.id, schema.namespace.length + 1);
+          mod[id] = {};
+          $Array.forEach(enumValues, function(enumValue) {
+            // Note: enums can be declared either as a list of strings
+            // ['foo', 'bar'] or as a list of objects
+            // [{'name': 'foo'}, {'name': 'bar'}].
+            enumValue = $Object.hasOwnProperty(enumValue, 'name') ?
+                enumValue.name : enumValue;
+            if (enumValue) {  // Avoid setting any empty enums.
+              // Make all properties in ALL_CAPS_STYLE.
+              //
+              // The built-in versions of $String.replace call other built-ins,
+              // which may be clobbered. Instead, manually build the property
+              // name.
+              //
+              // If the first character is a digit (we know it must be one of
+              // a digit, a letter, or an underscore), precede it with an
+              // underscore.
+              var propertyName = ($RegExp.exec(/\d/, enumValue[0])) ? '_' : '';
+              for (var i = 0; i < enumValue.length; ++i) {
+                var next;
+                if (i > 0 && $RegExp.exec(/[a-z]/, enumValue[i-1]) &&
+                    $RegExp.exec(/[A-Z]/, enumValue[i])) {
+                  // Replace myEnum-Foo with my_Enum-Foo:
+                  next = '_' + enumValue[i];
+                } else if ($RegExp.exec(/\W/, enumValue[i])) {
+                  // Replace my_Enum-Foo with my_Enum_Foo:
+                  next = '_';
+                } else {
+                  next = enumValue[i];
+                }
+                propertyName += next;
+              }
+              // Uppercase (replace my_Enum_Foo with MY_ENUM_FOO):
+              propertyName = $String.toUpperCase(propertyName);
+              mod[id][propertyName] = enumValue;
+            }
+          });
+        }
+      }, this);
+    }
+
+    // TODO(cduvall): Take out when all APIs have been converted to features.
+    // Returns whether access to the content of a schema should be denied,
+    // based on the presence of "unprivileged" and whether this is an
+    // extension process (versus e.g. a content script).
+    function isSchemaAccessAllowed(itemSchema) {
+      return (contextType == 'BLESSED_EXTENSION') ||
+             schema.unprivileged ||
+             itemSchema.unprivileged;
+    };
+
+    // Setup Functions.
+    if (schema.functions) {
+      $Array.forEach(schema.functions, function(functionDef) {
+        if (functionDef.name in mod) {
+          throw new Error('Function ' + functionDef.name +
+                          ' already defined in ' + schema.namespace);
+        }
+
+        if (!isSchemaNodeSupported(functionDef, platform, manifestVersion)) {
+          this.apiFunctions_.registerUnavailable(functionDef.name);
+          return;
+        }
+
+        var apiFunction = { __proto__: null };
+        apiFunction.definition = functionDef;
+        apiFunction.name = schema.namespace + '.' + functionDef.name;
+
+        if (!GetAvailability(apiFunction.name).is_available ||
+            (checkUnprivileged && !isSchemaAccessAllowed(functionDef))) {
+          this.apiFunctions_.registerUnavailable(functionDef.name);
+          return;
+        }
+
+        // TODO(aa): It would be best to run this in a unit test, but in order
+        // to do that we would need to better factor this code so that it
+        // doesn't depend on so much v8::Extension machinery.
+        if (logging.DCHECK_IS_ON() &&
+            schemaUtils.isFunctionSignatureAmbiguous(apiFunction.definition)) {
+          throw new Error(
+              apiFunction.name + ' has ambiguous optional arguments. ' +
+              'To implement custom disambiguation logic, add ' +
+              '"allowAmbiguousOptionalArguments" to the function\'s schema.');
+        }
+
+        this.apiFunctions_.register(functionDef.name, apiFunction);
+
+        mod[functionDef.name] = $Function.bind(function() {
+          var args = $Array.slice(arguments);
+          if (this.updateArgumentsPreValidate)
+            args = $Function.apply(this.updateArgumentsPreValidate, this, args);
+
+          args = schemaUtils.normalizeArgumentsAndValidate(args, this);
+          if (this.updateArgumentsPostValidate) {
+            args = $Function.apply(this.updateArgumentsPostValidate,
+                                   this,
+                                   args);
+          }
+
+          sendRequestHandler.clearCalledSendRequest();
+
+          var retval;
+          if (this.handleRequest) {
+            retval = $Function.apply(this.handleRequest, this, args);
+          } else {
+            var optArgs = {
+              __proto__: null,
+              customCallback: this.customCallback
+            };
+            retval = sendRequest(this.name, args,
+                                 this.definition.parameters,
+                                 optArgs);
+          }
+          sendRequestHandler.clearCalledSendRequest();
+
+          // Validate return value if in sanity check mode.
+          if (logging.DCHECK_IS_ON() && this.definition.returns)
+            schemaUtils.validate([retval], [this.definition.returns]);
+          return retval;
+        }, apiFunction);
+      }, this);
+    }
+
+    // Setup Events
+    if (schema.events) {
+      $Array.forEach(schema.events, function(eventDef) {
+        if (eventDef.name in mod) {
+          throw new Error('Event ' + eventDef.name +
+                          ' already defined in ' + schema.namespace);
+        }
+        if (!isSchemaNodeSupported(eventDef, platform, manifestVersion))
+          return;
+
+        var eventName = schema.namespace + "." + eventDef.name;
+        if (!GetAvailability(eventName).is_available ||
+            (checkUnprivileged && !isSchemaAccessAllowed(eventDef))) {
+          return;
+        }
+
+        var options = eventDef.options || {};
+        if (eventDef.filters && eventDef.filters.length > 0)
+          options.supportsFilters = true;
+
+        var parameters = eventDef.parameters;
+        if (this.customEvent_) {
+          mod[eventDef.name] = new this.customEvent_(
+              eventName, parameters, eventDef.extraParameters, options);
+        } else {
+          mod[eventDef.name] = new Event(eventName, parameters, options);
+        }
+      }, this);
+    }
+
+    function addProperties(m, parentDef) {
+      var properties = parentDef.properties;
+      if (!properties)
+        return;
+
+      forEach(properties, function(propertyName, propertyDef) {
+        if (propertyName in m)
+          return;  // TODO(kalman): be strict like functions/events somehow.
+        if (!isSchemaNodeSupported(propertyDef, platform, manifestVersion))
+          return;
+        if (!GetAvailability(schema.namespace + "." +
+              propertyName).is_available ||
+            (checkUnprivileged && !isSchemaAccessAllowed(propertyDef))) {
+          return;
+        }
+
+        // |value| is eventually added to |m|, the exposed API. Make copies
+        // of everything from the schema. (The schema is also frozen, so as long
+        // as we don't make any modifications, shallow copies are fine.)
+        var value;
+        if ($Array.isArray(propertyDef.value))
+          value = $Array.slice(propertyDef.value);
+        else if (typeof propertyDef.value === 'object')
+          value = $Object.assign({}, propertyDef.value);
+        else
+          value = propertyDef.value;
+
+        if (value) {
+          // Values may just have raw types as defined in the JSON, such
+          // as "WINDOW_ID_NONE": { "value": -1 }. We handle this here.
+          // TODO(kalman): enforce that things with a "value" property can't
+          // define their own types.
+          var type = propertyDef.type || typeof(value);
+          if (type === 'integer' || type === 'number') {
+            value = parseInt(value);
+          } else if (type === 'boolean') {
+            value = value === 'true';
+          } else if (propertyDef['$ref']) {
+            var ref = propertyDef['$ref'];
+            var type = utils.loadTypeSchema(propertyDef['$ref'], schema);
+            logging.CHECK(type, 'Schema for $ref type ' + ref + ' not found');
+            var constructor = createCustomType(type);
+            var args = value;
+            logging.DCHECK($Array.isArray(args));
+            $Array.push(args, type);
+            // For an object propertyDef, |value| is an array of constructor
+            // arguments, but we want to pass the arguments directly (i.e.
+            // not as an array), so we have to fake calling |new| on the
+            // constructor.
+            value = { __proto__: constructor.prototype };
+            $Function.apply(constructor, value, args);
+            // Recursively add properties.
+            addProperties(value, propertyDef);
+          } else if (type === 'object') {
+            // Recursively add properties.
+            addProperties(value, propertyDef);
+          } else if (type !== 'string') {
+            throw new Error('NOT IMPLEMENTED (extension_api.json error): ' +
+                'Cannot parse values for type "' + type + '"');
+          }
+          m[propertyName] = value;
+        }
+      });
+    };
+
+    addProperties(mod, schema);
+
+    // This generate() call is considered successful if any functions,
+    // properties, or events were created.
+    var success = ($Object.keys(mod).length > 0);
+
+    // Special case: webViewRequest is a vacuous API which just copies its
+    // implementation from declarativeWebRequest.
+    //
+    // TODO(kalman): This would be unnecessary if we did these checks after the
+    // hooks (i.e. this.runHooks_(mod)). The reason we don't is to be very
+    // conservative with running any JS which might actually be for an API
+    // which isn't available, but this is probably overly cautious given the
+    // C++ is only giving us APIs which are available. FIXME.
+    if (schema.namespace == 'webViewRequest') {
+      success = true;
+    }
+
+    // Special case: runtime.lastError is only occasionally set, so
+    // specifically check its availability.
+    if (schema.namespace == 'runtime' &&
+        GetAvailability('runtime.lastError').is_available) {
+      success = true;
+    }
+
+    if (!success) {
+      var availability = GetAvailability(schema.namespace);
+      // If an API was available it should have been successfully generated.
+      logging.DCHECK(!availability.is_available,
+                     schema.namespace + ' was available but not generated');
+      console.error('chrome.' + schema.namespace + ' is not available: ' +
+                    availability.message);
+      return;
+    }
+
+    this.runHooks_(mod, schema);
+    return mod;
+  }
+};
+
+exports.$set('Binding', Binding);
+// Copyright 2014 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+// Custom binding for the contextMenus API.
+
+var binding = apiBridge || require('binding').Binding.create('contextMenus');
+var contextMenusHandlers = require('contextMenusHandlers');
+
+binding.registerCustomHook(function(bindingsAPI) {
+  var apiFunctions = bindingsAPI.apiFunctions;
+
+  var handlers = contextMenusHandlers.create(false /* isWebview */);
+
+  apiFunctions.setHandleRequest('create', handlers.requestHandlers.create);
+
+  apiFunctions.setHandleRequest('remove', handlers.requestHandlers.remove);
+
+  apiFunctions.setHandleRequest('update', handlers.requestHandlers.update);
+
+  apiFunctions.setHandleRequest('removeAll',
+                                handlers.requestHandlers.removeAll);
+});
+
+if (!apiBridge)
+  exports.$set('binding', binding.generate());
+// Copyright 2015 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+// Implementation of custom bindings for the contextMenus API.
+// This is used to implement the contextMenus API for extensions and for the
+// <webview> tag (see chrome_web_view_experimental.js).
+
+var contextMenuNatives = requireNative('context_menus');
+var sendRequest = bindingUtil ?
+    $Function.bind(bindingUtil.sendRequest, bindingUtil) :
+    require('sendRequest').sendRequest;
+var hasLastError = bindingUtil ?
+    $Function.bind(bindingUtil.hasLastError, bindingUtil) :
+    require('lastError').hasError;
+
+var jsEvent;
+function createNewEvent(name) {
+  if (bindingUtil) {
+    // Native custom events ignore schema.
+    return bindingUtil.createCustomEvent(name, undefined, undefined);
+  }
+  if (!jsEvent)
+    jsEvent = require('event_bindings').Event;
+  return new jsEvent(name);
+}
+
+// Add the bindings to the contextMenus API.
+function createContextMenusHandlers(isWebview) {
+  var eventName = isWebview ? 'webViewInternal.contextMenus' : 'contextMenus';
+  // Some dummy value for chrome.contextMenus instances.
+  // Webviews use positive integers, and 0 to denote an invalid webview ID.
+  // The following constant is -1 to avoid any conflicts between webview IDs and
+  // extensions.
+  var INSTANCEID_NON_WEBVIEW = -1;
+
+  // Generates a customCallback for a given method. |handleCallback| will be
+  // invoked with the same arguments this function is called with.
+  function getCallback(handleCallback) {
+    return function() {
+      var extensionCallback = arguments[arguments.length - 1];
+      if (hasLastError(bindingUtil ? undefined : chrome)) {
+        if (extensionCallback)
+          extensionCallback();
+        return;
+      }
+
+      $Function.apply(handleCallback, null, arguments);
+      if (extensionCallback)
+        extensionCallback();
+    };
+  }
+
+  var contextMenus = { __proto__: null };
+  contextMenus.handlers = { __proto__: null };
+  contextMenus.event = createNewEvent(eventName);
+
+  contextMenus.getIdFromCreateProperties = function(createProperties) {
+    if (typeof createProperties.id !== 'undefined')
+      return createProperties.id;
+    return createProperties.generatedId;
+  };
+
+  contextMenus.handlersForId = function(instanceId, id) {
+    if (!contextMenus.handlers[instanceId]) {
+      contextMenus.handlers[instanceId] = {
+        generated: {},
+        string: {}
+      };
+    }
+    if (typeof id === 'number')
+      return contextMenus.handlers[instanceId].generated;
+    return contextMenus.handlers[instanceId].string;
+  };
+
+  contextMenus.ensureListenerSetup = function() {
+    if (contextMenus.listening) {
+      return;
+    }
+    contextMenus.listening = true;
+    contextMenus.event.addListener(function(info) {
+      var instanceId = INSTANCEID_NON_WEBVIEW;
+      if (isWebview) {
+        instanceId = info.webviewInstanceId;
+        // Don't expose |webviewInstanceId| via the public API.
+        delete info.webviewInstanceId;
+      }
+
+      var id = info.menuItemId;
+      var onclick = contextMenus.handlersForId(instanceId, id)[id];
+      if (onclick) {
+        $Function.apply(onclick, null, arguments);
+      }
+    });
+  };
+
+  // To be used with apiFunctions.setHandleRequest
+  var requestHandlers = { __proto__: null };
+
+  function createCallback(instanceId, id, onclick) {
+    if (onclick) {
+      contextMenus.ensureListenerSetup();
+      contextMenus.handlersForId(instanceId, id)[id] = onclick;
+    }
+  }
+
+  requestHandlers.create = function() {
+    var createProperties = isWebview ? arguments[1] : arguments[0];
+    createProperties.generatedId = contextMenuNatives.GetNextContextMenuId();
+    var id = contextMenus.getIdFromCreateProperties(createProperties);
+    var instanceId = isWebview ? arguments[0] : INSTANCEID_NON_WEBVIEW;
+    var onclick = createProperties.onclick;
+
+    var optArgs = {
+      __proto__: null,
+      customCallback: getCallback($Function.bind(createCallback, null,
+                                                 instanceId, id, onclick)),
+    };
+    var name = isWebview ?
+        'chromeWebViewInternal.contextMenusCreate' : 'contextMenus.create';
+    sendRequest(name, $Array.from(arguments),
+                bindingUtil ? undefined : this.definition.parameters,
+                optArgs);
+    return id;
+  };
+
+  function removeCallback(instanceId, id) {
+    delete contextMenus.handlersForId(instanceId, id)[id];
+  }
+
+  requestHandlers.remove = function() {
+    var instanceId = isWebview ? arguments[0] : INSTANCEID_NON_WEBVIEW;
+    var id = isWebview ? arguments[1] : arguments[0];
+    var optArgs = {
+      __proto__: null,
+      customCallback: getCallback($Function.bind(removeCallback, null,
+                                                 instanceId, id)),
+    };
+    var name = isWebview ?
+        'chromeWebViewInternal.contextMenusRemove' : 'contextMenus.remove';
+    sendRequest(name, $Array.from(arguments),
+                bindingUtil ? undefined : this.definition.parameters,
+                optArgs);
+  };
+
+  function updateCallback(instanceId, id, onclick) {
+    if (onclick) {
+      contextMenus.ensureListenerSetup();
+      contextMenus.handlersForId(instanceId, id)[id] = onclick;
+    } else if (onclick === null) {
+      // When onclick is explicitly set to null, remove the event listener.
+      delete contextMenus.handlersForId(instanceId, id)[id];
+    }
+  }
+
+  requestHandlers.update = function() {
+    var instanceId = isWebview ? arguments[0] : INSTANCEID_NON_WEBVIEW;
+    var id = isWebview ? arguments[1] : arguments[0];
+    var updateProperties = isWebview ? arguments[2] : arguments[1];
+    var onclick = updateProperties.onclick;
+    var optArgs = {
+      __proto__: null,
+      customCallback: getCallback($Function.bind(updateCallback, null,
+                                                 instanceId, id, onclick)),
+    };
+
+    var name = isWebview ?
+        'chromeWebViewInternal.contextMenusUpdate' :
+        'contextMenus.update';
+    sendRequest(name, $Array.from(arguments),
+                bindingUtil ? undefined : this.definition.parameters, optArgs);
+  };
+
+  function removeAllCallback(instanceId) {
+    delete contextMenus.handlers[instanceId];
+  }
+
+  requestHandlers.removeAll = function() {
+    var instanceId = isWebview ? arguments[0] : INSTANCEID_NON_WEBVIEW;
+    var optArgs = {
+      __proto__: null,
+      customCallback: getCallback($Function.bind(removeAllCallback, null,
+                                                 instanceId)),
+    };
+
+    var name = isWebview ?
+        'chromeWebViewInternal.contextMenusRemoveAll' :
+        'contextMenus.removeAll';
+    sendRequest(name, $Array.from(arguments),
+                this.definition.parameters, optArgs);
+  };
+
+  return {
+    requestHandlers: requestHandlers,
+  };
+}
+
+exports.$set('create', createContextMenusHandlers);
+// Copyright (c) 2012 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+// Custom binding for the declarativeWebRequest API.
+
+var binding = require('binding').Binding.create('declarativeWebRequest');
+
+var utils = require('utils');
+var validate = require('schemaUtils').validate;
+
+binding.registerCustomHook(function(api) {
+  var declarativeWebRequest = api.compiledApi;
+
+  // Returns the schema definition of type |typeId| defined in |namespace|.
+  function getSchema(typeId) {
+    return utils.lookup(api.schema.types,
+                        'id',
+                        'declarativeWebRequest.' + typeId);
+  }
+
+  // Helper function for the constructor of concrete datatypes of the
+  // declarative webRequest API.
+  // Makes sure that |this| contains the union of parameters and
+  // {'instanceType': 'declarativeWebRequest.' + typeId} and validates the
+  // generated union dictionary against the schema for |typeId|.
+  function setupInstance(instance, parameters, typeId) {
+    for (var key in parameters) {
+      if ($Object.hasOwnProperty(parameters, key)) {
+        instance[key] = parameters[key];
+      }
+    }
+    instance.instanceType = 'declarativeWebRequest.' + typeId;
+    var schema = getSchema(typeId);
+    validate([instance], [schema]);
+  }
+
+  // Setup all data types for the declarative webRequest API.
+  declarativeWebRequest.RequestMatcher = function(parameters) {
+    setupInstance(this, parameters, 'RequestMatcher');
+  };
+  declarativeWebRequest.CancelRequest = function(parameters) {
+    setupInstance(this, parameters, 'CancelRequest');
+  };
+  declarativeWebRequest.RedirectRequest = function(parameters) {
+    setupInstance(this, parameters, 'RedirectRequest');
+  };
+  declarativeWebRequest.SetRequestHeader = function(parameters) {
+    setupInstance(this, parameters, 'SetRequestHeader');
+  };
+  declarativeWebRequest.RemoveRequestHeader = function(parameters) {
+    setupInstance(this, parameters, 'RemoveRequestHeader');
+  };
+  declarativeWebRequest.AddResponseHeader = function(parameters) {
+    setupInstance(this, parameters, 'AddResponseHeader');
+  };
+  declarativeWebRequest.RemoveResponseHeader = function(parameters) {
+    setupInstance(this, parameters, 'RemoveResponseHeader');
+  };
+  declarativeWebRequest.RedirectToTransparentImage =
+      function(parameters) {
+    setupInstance(this, parameters, 'RedirectToTransparentImage');
+  };
+  declarativeWebRequest.RedirectToEmptyDocument = function(parameters) {
+    setupInstance(this, parameters, 'RedirectToEmptyDocument');
+  };
+  declarativeWebRequest.RedirectByRegEx = function(parameters) {
+    setupInstance(this, parameters, 'RedirectByRegEx');
+  };
+  declarativeWebRequest.IgnoreRules = function(parameters) {
+    setupInstance(this, parameters, 'IgnoreRules');
+  };
+  declarativeWebRequest.AddRequestCookie = function(parameters) {
+    setupInstance(this, parameters, 'AddRequestCookie');
+  };
+  declarativeWebRequest.AddResponseCookie = function(parameters) {
+    setupInstance(this, parameters, 'AddResponseCookie');
+  };
+  declarativeWebRequest.EditRequestCookie = function(parameters) {
+    setupInstance(this, parameters, 'EditRequestCookie');
+  };
+  declarativeWebRequest.EditResponseCookie = function(parameters) {
+    setupInstance(this, parameters, 'EditResponseCookie');
+  };
+  declarativeWebRequest.RemoveRequestCookie = function(parameters) {
+    setupInstance(this, parameters, 'RemoveRequestCookie');
+  };
+  declarativeWebRequest.RemoveResponseCookie = function(parameters) {
+    setupInstance(this, parameters, 'RemoveResponseCookie');
+  };
+  declarativeWebRequest.SendMessageToExtension = function(parameters) {
+    setupInstance(this, parameters, 'SendMessageToExtension');
+  };
+});
+
+exports.$set('binding', binding.generate());
+// Copyright 2015 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+// Custom binding for the Display Source API.
+
+var binding = require('binding').Binding.create('displaySource');
+var chrome = requireNative('chrome').GetChrome();
+var lastError = require('lastError');
+var natives = requireNative('display_source');
+var logging = requireNative('logging');
+
+var callbacksInfo = {};
+
+function callbackWrapper(callback, method, message) {
+  if (callback == undefined)
+    return;
+
+  try {
+    if (message !== null)
+      lastError.set(method, message, null, chrome);
+    callback();
+  } finally {
+    lastError.clear(chrome);
+  }
+}
+
+function callCompletionCallback(callbackId, error_message) {
+  try {
+    var callbackInfo = callbacksInfo[callbackId];
+    logging.DCHECK(callbackInfo != null);
+    callbackWrapper(callbackInfo.callback, callbackInfo.method, error_message);
+  } finally {
+    delete callbacksInfo[callbackId];
+  }
+}
+
+binding.registerCustomHook(function(bindingsAPI, extensionId) {
+  var apiFunctions = bindingsAPI.apiFunctions;
+  apiFunctions.setHandleRequest(
+      'startSession', function(sessionInfo, callback) {
+        try {
+          var callId = natives.StartSession(sessionInfo);
+          callbacksInfo[callId] = {
+            callback: callback,
+            method: 'displaySource.startSession'
+          };
+        } catch (e) {
+          callbackWrapper(callback, 'displaySource.startSession', e.message);
+        }
+      });
+  apiFunctions.setHandleRequest(
+      'terminateSession', function(sink_id, callback) {
+        try {
+          var callId = natives.TerminateSession(sink_id);
+          callbacksInfo[callId] = {
+            callback: callback,
+            method: 'displaySource.terminateSession'
+          };
+        } catch (e) {
+          callbackWrapper(
+              callback, 'displaySource.terminateSession', e.message);
+        }
+      });
+});
+
+exports.$set('binding', binding.generate());
+// Called by C++.
+exports.$set('callCompletionCallback', callCompletionCallback);
+// Copyright 2014 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+// Custom binding for the extension API.
+
+var binding = require('binding').Binding.create('extension');
+
+var messaging = require('messaging');
+var runtimeNatives = requireNative('runtime');
+var GetExtensionViews = runtimeNatives.GetExtensionViews;
+var chrome = requireNative('chrome').GetChrome();
+
+var inIncognitoContext = requireNative('process').InIncognitoContext();
+var sendRequestIsDisabled = requireNative('process').IsSendRequestDisabled();
+var contextType = requireNative('process').GetContextType();
+var manifestVersion = requireNative('process').GetManifestVersion();
+
+// This should match chrome.windows.WINDOW_ID_NONE.
+//
+// We can't use chrome.windows.WINDOW_ID_NONE directly because the
+// chrome.windows API won't exist unless this extension has permission for it;
+// which may not be the case.
+var WINDOW_ID_NONE = -1;
+var TAB_ID_NONE = -1;
+
+binding.registerCustomHook(function(bindingsAPI, extensionId) {
+  var extension = bindingsAPI.compiledApi;
+  if (manifestVersion < 2) {
+    chrome.self = extension;
+    extension.inIncognitoTab = inIncognitoContext;
+  }
+  extension.inIncognitoContext = inIncognitoContext;
+
+  var apiFunctions = bindingsAPI.apiFunctions;
+
+  apiFunctions.setHandleRequest('getViews', function(properties) {
+    var windowId = WINDOW_ID_NONE;
+    var tabId = TAB_ID_NONE;
+    var type = 'ALL';
+    if (properties) {
+      if (properties.type != null) {
+        type = properties.type;
+      }
+      if (properties.windowId != null) {
+        windowId = properties.windowId;
+      }
+      if (properties.tabId != null) {
+        tabId = properties.tabId;
+      }
+    }
+    return GetExtensionViews(windowId, tabId, type);
+  });
+
+  apiFunctions.setHandleRequest('getBackgroundPage', function() {
+    return GetExtensionViews(-1, -1, 'BACKGROUND')[0] || null;
+  });
+
+  apiFunctions.setHandleRequest('getExtensionTabs', function(windowId) {
+    if (windowId == null)
+      windowId = WINDOW_ID_NONE;
+    return GetExtensionViews(windowId, -1, 'TAB');
+  });
+
+  apiFunctions.setHandleRequest('getURL', function(path) {
+    path = String(path);
+    if (!path.length || path[0] != '/')
+      path = '/' + path;
+    return 'chrome-extension://' + extensionId + path;
+  });
+
+  // Alias several messaging deprecated APIs to their runtime counterparts.
+  var mayNeedAlias = [
+    // Types
+    'Port',
+    // Functions
+    'connect', 'sendMessage', 'connectNative', 'sendNativeMessage',
+    // Events
+    'onConnect', 'onConnectExternal', 'onMessage', 'onMessageExternal'
+  ];
+  $Array.forEach(mayNeedAlias, function(alias) {
+    // Checking existence isn't enough since some functions are disabled via
+    // getters that throw exceptions. Assume that any getter is such a function.
+    if (chrome.runtime &&
+        $Object.hasOwnProperty(chrome.runtime, alias) &&
+        chrome.runtime.__lookupGetter__(alias) === undefined) {
+      extension[alias] = chrome.runtime[alias];
+    }
+  });
+
+  apiFunctions.setUpdateArgumentsPreValidate('sendRequest',
+      $Function.bind(messaging.sendMessageUpdateArguments,
+                     null, 'sendRequest', false /* hasOptionsArgument */));
+
+  apiFunctions.setHandleRequest('sendRequest',
+                                function(targetId, request, responseCallback) {
+    if (sendRequestIsDisabled)
+      throw new Error(sendRequestIsDisabled);
+    var port = chrome.runtime.connect(targetId || extensionId,
+                                      {name: messaging.kRequestChannel});
+    messaging.sendMessageImpl(port, request, responseCallback);
+  });
+
+  if (sendRequestIsDisabled) {
+    extension.onRequest.addListener = function() {
+      throw new Error(sendRequestIsDisabled);
+    };
+    if (contextType == 'BLESSED_EXTENSION') {
+      extension.onRequestExternal.addListener = function() {
+        throw new Error(sendRequestIsDisabled);
+      };
+    }
+  }
+});
+
+exports.$set('binding', binding.generate());
+// Copyright 2014 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+// -----------------------------------------------------------------------------
+// NOTE: If you change this file you need to touch renderer_resources.grd to
+// have your change take effect.
+// -----------------------------------------------------------------------------
+
+// Partial implementation of the Greasemonkey API, see:
+// http://wiki.greasespot.net/Greasemonkey_Manual:APIs
+
+function GM_addStyle(css) {
+  var parent = document.getElementsByTagName("head")[0];
+  if (!parent) {
+    parent = document.documentElement;
+  }
+  var style = document.createElement("style");
+  style.type = "text/css";
+  var textNode = document.createTextNode(css);
+  style.appendChild(textNode);
+  parent.appendChild(style);
+}
+
+function GM_xmlhttpRequest(details) {
+  function setupEvent(xhr, url, eventName, callback) {
+    xhr[eventName] = function () {
+      var isComplete = xhr.readyState == 4;
+      var responseState = {
+        responseText: xhr.responseText,
+        readyState: xhr.readyState,
+        responseHeaders: isComplete ? xhr.getAllResponseHeaders() : "",
+        status: isComplete ? xhr.status : 0,
+        statusText: isComplete ? xhr.statusText : "",
+        finalUrl: isComplete ? url : ""
+      };
+      callback(responseState);
+    };
+  }
+
+  var xhr = new XMLHttpRequest();
+  var eventNames = ["onload", "onerror", "onreadystatechange"];
+  for (var i = 0; i < eventNames.length; i++ ) {
+    var eventName = eventNames[i];
+    if (eventName in details) {
+      setupEvent(xhr, details.url, eventName, details[eventName]);
+    }
+  }
+
+  xhr.open(details.method, details.url);
+
+  if (details.overrideMimeType) {
+    xhr.overrideMimeType(details.overrideMimeType);
+  }
+  if (details.headers) {
+    for (var header in details.headers) {
+      xhr.setRequestHeader(header, details.headers[header]);
+    }
+  }
+  xhr.send(details.data ? details.data : null);
+}
+
+function GM_openInTab(url) {
+  window.open(url, "");
+}
+
+function GM_log(message) {
+  window.console.log(message);
+}
+
+(function() {
+  function generateGreasemonkeyStub(name) {
+    return function() {
+      console.log("%s is not supported.", name);
+    };
+  }
+
+  var apis = ["GM_getValue", "GM_setValue", "GM_registerMenuCommand"];
+  for (var i = 0, api; api = apis[i]; i++) {
+    window[api] = generateGreasemonkeyStub(api);
+  }
+})();
+// Copyright 2014 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+// Custom binding for the i18n API.
+
+var binding = require('binding').Binding.create('i18n');
+
+var i18nNatives = requireNative('i18n');
+var GetL10nMessage = i18nNatives.GetL10nMessage;
+var GetL10nUILanguage = i18nNatives.GetL10nUILanguage;
+var DetectTextLanguage = i18nNatives.DetectTextLanguage;
+
+binding.registerCustomHook(function(bindingsAPI, extensionId) {
+  var apiFunctions = bindingsAPI.apiFunctions;
+
+  apiFunctions.setUpdateArgumentsPreValidate('getMessage', function() {
+    var args = $Array.slice(arguments);
+
+    // The first argument is the message, and should be a string.
+    var message = args[0];
+    if (typeof(message) !== 'string') {
+      console.warn(extensionId + ': the first argument to getMessage should ' +
+                   'be type "string", was ' + message +
+                   ' (type "' + typeof(message) + '")');
+      args[0] = String(message);
+    }
+
+    return args;
+  });
+
+  apiFunctions.setHandleRequest('getMessage',
+                                function(messageName, substitutions) {
+    return GetL10nMessage(messageName, substitutions, extensionId);
+  });
+
+  apiFunctions.setHandleRequest('getUILanguage', function() {
+    return GetL10nUILanguage();
+  });
+
+  apiFunctions.setHandleRequest('detectLanguage', function(text, callback) {
+    window.setTimeout(function() {
+      var response = DetectTextLanguage(text);
+      callback(response);
+    }, 0);
+  });
+});
+
+exports.$set('binding', binding.generate());
+// Copyright 2015 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+/**
+ * Custom bindings for the mojoPrivate API.
+ */
+
+let binding = require('binding').Binding.create('mojoPrivate');
+
+binding.registerCustomHook(function(bindingsAPI) {
+  let apiFunctions = bindingsAPI.apiFunctions;
+
+  apiFunctions.setHandleRequest('define', function(name, deps, factory) {
+    define(name, deps || [], factory);
+  });
+
+  apiFunctions.setHandleRequest('requireAsync', function(moduleName) {
+    return requireAsync(moduleName);
+  });
+});
+
+exports.$set('binding', binding.generate());
+// Copyright 2014 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+// Custom binding for the Permissions API.
+
+var binding = require('binding').Binding.create('permissions');
+
+var Event = require('event_bindings').Event;
+
+// These custom binding are only necessary because it is not currently
+// possible to have a union of types as the type of the items in an array.
+// Once that is fixed, this entire file should go away.
+// See,
+// https://code.google.com/p/chromium/issues/detail?id=162044
+// https://code.google.com/p/chromium/issues/detail?id=162042
+// TODO(bryeung): delete this file.
+binding.registerCustomHook(function(api) {
+  var apiFunctions = api.apiFunctions;
+  var permissions = api.compiledApi;
+
+  function maybeConvertToObject(str) {
+    var parts = $String.split(str, '|');
+    if (parts.length != 2)
+      return str;
+
+    var ret = {};
+    ret[parts[0]] = JSON.parse(parts[1]);
+    return ret;
+  }
+
+  function convertObjectPermissionsToStrings() {
+    if (arguments.length < 1)
+      return arguments;
+
+    var args = arguments[0].permissions;
+    if (!args)
+      return arguments;
+
+    for (var i = 0; i < args.length; i += 1) {
+      if (typeof(args[i]) == 'object') {
+        var a = args[i];
+        var keys = $Object.keys(a);
+        if (keys.length != 1) {
+          throw new Error("Too many keys in object-style permission.");
+        }
+        arguments[0].permissions[i] = keys[0] + '|' +
+            JSON.stringify(a[keys[0]]);
+      }
+    }
+
+    return arguments;
+  }
+
+  // Convert complex permissions to strings so they validate against the schema
+  apiFunctions.setUpdateArgumentsPreValidate(
+      'contains', convertObjectPermissionsToStrings);
+  apiFunctions.setUpdateArgumentsPreValidate(
+      'remove', convertObjectPermissionsToStrings);
+  apiFunctions.setUpdateArgumentsPreValidate(
+      'request', convertObjectPermissionsToStrings);
+
+  // Convert complex permissions back to objects
+  apiFunctions.setCustomCallback('getAll',
+      function(name, request, callback, response) {
+        for (var i = 0; i < response.permissions.length; i += 1) {
+          response.permissions[i] =
+              maybeConvertToObject(response.permissions[i]);
+        }
+
+        // Since the schema says Permissions.permissions contains strings and
+        // not objects, validation will fail after the for-loop above.  This
+        // skips validation and calls the callback directly.
+        if (callback)
+          callback(response);
+      });
+
+  // Also convert complex permissions back to objects for events.  The
+  // dispatchToListener call happens after argument validation, which works
+  // around the problem that Permissions.permissions is supposed to be a list
+  // of strings.
+  permissions.onAdded.dispatchToListener = function(callback, args) {
+    for (var i = 0; i < args[0].permissions.length; i += 1) {
+      args[0].permissions[i] = maybeConvertToObject(args[0].permissions[i]);
+    }
+    $Function.call(Event.prototype.dispatchToListener, this, callback, args);
+  };
+  permissions.onRemoved.dispatchToListener =
+      permissions.onAdded.dispatchToListener;
+});
+
+exports.$set('binding', binding.generate());
+// Copyright 2015 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+var binding = require('binding').Binding.create('printerProvider');
+var printerProviderInternal = require('binding').Binding.create(
+    'printerProviderInternal').generate();
+var eventBindings = require('event_bindings');
+var blobNatives = requireNative('blob_natives');
+
+var printerProviderSchema =
+    requireNative('schema_registry').GetSchema('printerProvider')
+var utils = require('utils');
+var validate = require('schemaUtils').validate;
+
+// Custom bindings for chrome.printerProvider API.
+// The bindings are used to implement callbacks for the API events. Internally
+// each event is passed requestId argument used to identify the callback
+// associated with the event. This argument is massaged out from the event
+// arguments before dispatching the event to consumers. A callback is appended
+// to the event arguments. The callback wraps an appropriate
+// chrome.printerProviderInternal API function that is used to report the event
+// result from the extension. The function is passed requestId and values
+// provided by the extension. It validates that the values provided by the
+// extension match chrome.printerProvider event callback schemas. It also
+// ensures that a callback is run at most once. In case there is an exception
+// during event dispatching, the chrome.printerProviderInternal function
+// is called with a default error value.
+//
+
+// Handles a chrome.printerProvider event as described in the file comment.
+// |eventName|: The event name.
+// |prepareArgsForDispatch|: Function called before dispatching the event to
+//     the extension. It's called with original event |args| list and callback
+//     that should be called when the |args| are ready for dispatch. The
+//     callbacks should report whether the argument preparation was successful.
+//     The function should not change the first argument, which contains the
+//     request id.
+// |resultreporter|: The function that should be called to report event result.
+//     One of chrome.printerProviderInternal API functions.
+function handleEvent(eventName, prepareArgsForDispatch, resultReporter) {
+  eventBindings.registerArgumentMassager(
+      'printerProvider.' + eventName,
+      function(args, dispatch) {
+        var responded = false;
+
+        // Validates that the result passed by the extension to the event
+        // callback matches the callback schema. Throws an exception in case of
+        // an error.
+        var validateResult = function(result) {
+          var eventSchema =
+              utils.lookup(printerProviderSchema.events, 'name', eventName);
+          var callbackSchema =
+              utils.lookup(eventSchema.parameters, 'type', 'function');
+
+          validate([result], callbackSchema.parameters);
+        };
+
+        // Function provided to the extension as the event callback argument.
+        // It makes sure that the event result hasn't previously been returned
+        // and that the provided result matches the callback schema. In case of
+        // an error it throws an exception.
+        var reportResult = function(result) {
+          if (responded) {
+            throw new Error(
+                'Event callback must not be called more than once.');
+          }
+
+          var finalResult = null;
+          try {
+            validateResult(result);  // throws on failure
+            finalResult = result;
+          } finally {
+            responded = true;
+            resultReporter(args[0] /* requestId */, finalResult);
+          }
+        };
+
+        prepareArgsForDispatch(args, function(success) {
+          if (!success) {
+            // Do not throw an exception since the extension should not yet be
+            // aware of the event.
+            resultReporter(args[0] /* requestId */, null);
+            return;
+          }
+          dispatch(args.slice(1).concat(reportResult));
+        });
+      });
+}
+
+// Sets up printJob.document property for a print request.
+function createPrintRequestBlobArguments(args, callback) {
+  printerProviderInternal.getPrintData(args[0] /* requestId */,
+                                       function(blobInfo) {
+    if (chrome.runtime.lastError) {
+      callback(false);
+      return;
+    }
+
+    // |args[1]| is printJob.
+    args[1].document = blobNatives.TakeBrowserProcessBlob(
+        blobInfo.blobUuid, blobInfo.type, blobInfo.size);
+    callback(true);
+  });
+}
+
+handleEvent('onGetPrintersRequested',
+            function(args, callback) { callback(true); },
+            printerProviderInternal.reportPrinters);
+
+handleEvent('onGetCapabilityRequested',
+            function(args, callback) { callback(true); },
+            printerProviderInternal.reportPrinterCapability);
+
+handleEvent('onPrintRequested',
+            createPrintRequestBlobArguments,
+            printerProviderInternal.reportPrintResult);
+
+handleEvent('onGetUsbPrinterInfoRequested',
+            function(args, callback) { callback(true); },
+            printerProviderInternal.reportUsbPrinterInfo);
+
+exports.$set('binding', binding.generate());
+// Copyright 2014 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+// Custom binding for the runtime API.
+
+var binding = apiBridge || require('binding').Binding.create('runtime');
+
+var messaging = require('messaging');
+var runtimeNatives = requireNative('runtime');
+var messagingNatives = requireNative('messaging_natives');
+var process = requireNative('process');
+var utils = require('utils');
+
+var WINDOW = {};
+try {
+  WINDOW = window;
+} catch (e) {
+  // Running in SW context.
+  // TODO(lazyboy): Synchronous access to background page is not possible from
+  // service worker context. Decide what we should do in this case for the class
+  // of APIs that require access to background page or window object
+}
+
+var backgroundPage = WINDOW;
+var backgroundRequire = require;
+var contextType = process.GetContextType();
+
+if (contextType == 'BLESSED_EXTENSION' ||
+    contextType == 'UNBLESSED_EXTENSION') {
+  var manifest = runtimeNatives.GetManifest();
+  if (manifest.app && manifest.app.background) {
+    // Get the background page if one exists. Otherwise, default to the current
+    // window.
+    backgroundPage = runtimeNatives.GetExtensionViews(-1, -1, 'BACKGROUND')[0];
+    if (backgroundPage) {
+      var GetModuleSystem = requireNative('v8_context').GetModuleSystem;
+      backgroundRequire = GetModuleSystem(backgroundPage).require;
+    } else {
+      backgroundPage = WINDOW;
+    }
+  }
+}
+
+// For packaged apps, all windows use the bindFileEntryCallback from the
+// background page so their FileEntry objects have the background page's context
+// as their own.  This allows them to be used from other windows (including the
+// background page) after the original window is closed.
+if (WINDOW == backgroundPage) {
+  var lastError = require('lastError');
+  var fileSystemNatives = requireNative('file_system_natives');
+  var GetIsolatedFileSystem = fileSystemNatives.GetIsolatedFileSystem;
+  var bindDirectoryEntryCallback = function(functionName, apiFunctions) {
+    apiFunctions.setCustomCallback(functionName,
+        function(name, request, callback, response) {
+      if (callback) {
+        if (!response) {
+          callback();
+          return;
+        }
+        var fileSystemId = response.fileSystemId;
+        var baseName = response.baseName;
+        var fs = GetIsolatedFileSystem(fileSystemId);
+
+        try {
+          fs.root.getDirectory(baseName, {}, callback, function(fileError) {
+            lastError.run('runtime.' + functionName,
+                          'Error getting Entry, code: ' + fileError.code,
+                          request.stack,
+                          callback);
+          });
+        } catch (e) {
+          lastError.run('runtime.' + functionName,
+                        'Error: ' + e.stack,
+                        request.stack,
+                        callback);
+        }
+      }
+    });
+  };
+} else {
+  // Force the runtime API to be loaded in the background page. Using
+  // backgroundPageModuleSystem.require('runtime') is insufficient as
+  // requireNative is only allowed while lazily loading an API.
+  backgroundPage.chrome.runtime;
+  var bindDirectoryEntryCallback =
+      backgroundRequire('runtime').bindDirectoryEntryCallback;
+}
+
+binding.registerCustomHook(function(binding, id, contextType) {
+  var apiFunctions = binding.apiFunctions;
+  var runtime = binding.compiledApi;
+
+  //
+  // Unprivileged APIs.
+  //
+
+  if (id != '')
+    utils.defineProperty(runtime, 'id', id);
+
+  apiFunctions.setHandleRequest('getManifest', function() {
+    return runtimeNatives.GetManifest();
+  });
+
+  apiFunctions.setHandleRequest('getURL', function(path) {
+    path = $String.self(path);
+    if (!path.length || path[0] != '/')
+      path = '/' + path;
+    return 'chrome-extension://' + id + path;
+  });
+
+  var sendMessageUpdateArguments = messaging.sendMessageUpdateArguments;
+  apiFunctions.setUpdateArgumentsPreValidate(
+      'sendMessage',
+      $Function.bind(sendMessageUpdateArguments, null, 'sendMessage',
+                     true /* hasOptionsArgument */));
+  apiFunctions.setUpdateArgumentsPreValidate(
+      'sendNativeMessage',
+      $Function.bind(sendMessageUpdateArguments, null, 'sendNativeMessage',
+                     false /* hasOptionsArgument */));
+
+  apiFunctions.setHandleRequest(
+      'sendMessage',
+      function(targetId, message, options, responseCallback) {
+    var connectOptions = $Object.assign({
+      __proto__: null,
+      name: messaging.kMessageChannel,
+    }, options);
+    var port = runtime.connect(targetId, connectOptions);
+    messaging.sendMessageImpl(port, message, responseCallback);
+  });
+
+  apiFunctions.setHandleRequest('sendNativeMessage',
+                                function(targetId, message, responseCallback) {
+    var port = runtime.connectNative(targetId);
+    messaging.sendMessageImpl(port, message, responseCallback);
+  });
+
+  apiFunctions.setHandleRequest('connect', function(targetId, connectInfo) {
+    if (!targetId) {
+      // id is only defined inside extensions. If we're in a webpage, the best
+      // we can do at this point is to fail.
+      if (!id) {
+        throw new Error('chrome.runtime.connect() called from a webpage must ' +
+                        'specify an Extension ID (string) for its first ' +
+                        'argument');
+      }
+      targetId = id;
+    }
+
+    var name = '';
+    if (connectInfo && connectInfo.name)
+      name = connectInfo.name;
+
+    var includeTlsChannelId =
+      !!(connectInfo && connectInfo.includeTlsChannelId);
+
+    var portId = messagingNatives.OpenChannelToExtension(targetId, name,
+                                                         includeTlsChannelId);
+    if (portId >= 0)
+      return messaging.createPort(portId, name);
+  });
+
+  //
+  // Privileged APIs.
+  //
+  if (contextType != 'BLESSED_EXTENSION')
+    return;
+
+  apiFunctions.setHandleRequest('connectNative',
+                                function(nativeAppName) {
+    var portId = messagingNatives.OpenChannelToNativeApp(nativeAppName);
+    if (portId >= 0)
+      return messaging.createPort(portId, '');
+    throw new Error('Error connecting to native app: ' + nativeAppName);
+  });
+
+  apiFunctions.setCustomCallback('getBackgroundPage',
+                                 function(name, request, callback, response) {
+    if (callback) {
+      var bg =
+          runtimeNatives.GetExtensionViews(-1, -1, 'BACKGROUND')[0] || null;
+      callback(bg);
+    }
+  });
+
+  bindDirectoryEntryCallback('getPackageDirectoryEntry', apiFunctions);
+});
+
+exports.$set('bindDirectoryEntryCallback', bindDirectoryEntryCallback);
+if (!apiBridge)
+  exports.$set('binding', binding.generate());
+// Copyright 2015 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+// This function is returned to DidInitializeServiceWorkerContextOnWorkerThread
+// then executed, passing in dependencies as function arguments.
+//
+// |backgroundUrl| is the URL of the extension's background page.
+// |wakeEventPage| is a function that wakes up the current extension's event
+// page, then runs its callback on completion or failure.
+// |logging| is an object equivalent to a subset of base/debug/logging.h, with
+// CHECK/DCHECK/etc.
+(function(backgroundUrl, wakeEventPage, logging) {
+  'use strict';
+  self.chrome = self.chrome || {};
+  self.chrome.runtime = self.chrome.runtime || {};
+
+  // Returns a Promise that resolves to the background page's client, or null
+  // if there is no background client.
+  function findBackgroundClient() {
+    return self.clients.matchAll({
+      includeUncontrolled: true,
+      type: 'window'
+    }).then(function(clients) {
+      return clients.find(function(client) {
+        return client.url == backgroundUrl;
+      });
+    });
+  }
+
+  // Returns a Promise wrapper around wakeEventPage, that resolves on success,
+  // or rejects on failure.
+  function makeWakeEventPagePromise() {
+    return new Promise(function(resolve, reject) {
+      wakeEventPage(function(success) {
+        if (success)
+          resolve();
+        else
+          reject('Failed to start background client "' + backgroundUrl + '"');
+      });
+    });
+  }
+
+  // The chrome.runtime.getBackgroundClient function is documented in
+  // runtime.json. It returns a Promise that resolves to the background page's
+  // client, or is rejected if there is no background client or if the
+  // background client failed to wake.
+  self.chrome.runtime.getBackgroundClient = function() {
+    return findBackgroundClient().then(function(client) {
+      if (client) {
+        // Background client is already awake, or it was persistent.
+        return client;
+      }
+
+      // Event page needs to be woken.
+      return makeWakeEventPagePromise().then(function() {
+        return findBackgroundClient();
+      }).then(function(client) {
+        if (!client) {
+          return Promise.reject(
+            'Background client "' + backgroundUrl + '" not found');
+        }
+        return client;
+      });
+    });
+  };
+});
+// Copyright (c) 2012 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+// Custom binding for the webRequest API.
+
+var binding = apiBridge || require('binding').Binding.create('webRequest');
+var sendRequest = bindingUtil ?
+    $Function.bind(bindingUtil.sendRequest, bindingUtil) :
+    require('sendRequest').sendRequest;
+
+binding.registerCustomHook(function(api) {
+  var apiFunctions = api.apiFunctions;
+
+  apiFunctions.setHandleRequest('handlerBehaviorChanged', function() {
+    var args = $Array.slice(arguments);
+    sendRequest(this.name, args, this.definition.parameters,
+                {__proto__: null, forIOThread: true});
+  });
+});
+
+if (!apiBridge) {
+  var webRequestEvent = require('webRequestEvent').WebRequestEvent;
+  binding.registerCustomEvent(webRequestEvent);
+  exports.$set('binding', binding.generate());
+}
+// Copyright 2017 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+var CHECK = requireNative('logging').CHECK;
+var eventBindings = bindingUtil ? undefined : require('event_bindings');
+var idGeneratorNatives = requireNative('id_generator');
+var utils = require('utils');
+var validate = require('schemaUtils').validate;
+var webRequestInternal = getInternalApi ?
+    getInternalApi('webRequestInternal') :
+    require('webRequestInternal').binding;
+
+function getUniqueSubEventName(eventName) {
+  return eventName + '/' + idGeneratorNatives.GetNextId();
+}
+
+function createSubEvent(name, argSchemas) {
+  if (bindingUtil)
+    return bindingUtil.createCustomEvent(name, undefined, false);
+  return new eventBindings.Event(name, argSchemas);
+}
+
+// WebRequestEventImpl object. This is used for special webRequest events
+// with extra parameters. Each invocation of addListener creates a new named
+// sub-event. That sub-event is associated with the extra parameters in the
+// browser process, so that only it is dispatched when the main event occurs
+// matching the extra parameters.
+//
+// Example:
+//   chrome.webRequest.onBeforeRequest.addListener(
+//       callback, {urls: 'http://*.google.com/*'});
+//   ^ callback will only be called for onBeforeRequests matching the filter.
+function WebRequestEventImpl(eventName, opt_argSchemas, opt_extraArgSchemas,
+                             opt_eventOptions, opt_webViewInstanceId) {
+  if (typeof eventName != 'string')
+    throw new Error('chrome.WebRequestEvent requires an event name.');
+
+  this.eventName = eventName;
+  this.argSchemas = opt_argSchemas;
+  this.extraArgSchemas = opt_extraArgSchemas;
+  this.webViewInstanceId = opt_webViewInstanceId || 0;
+  this.subEvents = [];
+  if (eventBindings) {
+    var eventOptions = eventBindings.parseEventOptions(opt_eventOptions);
+    CHECK(!eventOptions.supportsRules, eventName + ' supports rules');
+    CHECK(eventOptions.supportsListeners,
+          eventName + ' does not support listeners');
+  }
+}
+$Object.setPrototypeOf(WebRequestEventImpl.prototype, null);
+
+// Test if the given callback is registered for this event.
+WebRequestEventImpl.prototype.hasListener = function(cb) {
+  return this.findListener_(cb) > -1;
+};
+
+// Test if any callbacks are registered fur thus event.
+WebRequestEventImpl.prototype.hasListeners = function() {
+  return this.subEvents.length > 0;
+};
+
+// Registers a callback to be called when this event is dispatched. If
+// opt_filter is specified, then the callback is only called for events that
+// match the given filters. If opt_extraInfo is specified, the given optional
+// info is sent to the callback.
+WebRequestEventImpl.prototype.addListener =
+    function(cb, opt_filter, opt_extraInfo) {
+  // NOTE(benjhayden) New APIs should not use this subEventName trick! It does
+  // not play well with event pages. See downloads.onDeterminingFilename and
+  // ExtensionDownloadsEventRouter for an alternative approach.
+  var subEventName = getUniqueSubEventName(this.eventName);
+  // Note: this could fail to validate, in which case we would not add the
+  // subEvent listener.
+  validate($Array.slice(arguments, 1), this.extraArgSchemas);
+  webRequestInternal.addEventListener(
+      cb, opt_filter, opt_extraInfo, this.eventName, subEventName,
+      this.webViewInstanceId);
+
+  var subEvent = createSubEvent(subEventName, this.argSchemas);
+  var subEventCallback = cb;
+  if (opt_extraInfo && opt_extraInfo.indexOf('blocking') >= 0) {
+    var eventName = this.eventName;
+    subEventCallback = function() {
+      var requestId = arguments[0].requestId;
+      try {
+        var result = $Function.apply(cb, null, arguments);
+        webRequestInternal.eventHandled(
+            eventName, subEventName, requestId, result);
+      } catch (e) {
+        webRequestInternal.eventHandled(
+            eventName, subEventName, requestId);
+        throw e;
+      }
+    };
+  } else if (opt_extraInfo && opt_extraInfo.indexOf('asyncBlocking') >= 0) {
+    var eventName = this.eventName;
+    subEventCallback = function() {
+      var details = arguments[0];
+      var requestId = details.requestId;
+      var handledCallback = function(response) {
+        webRequestInternal.eventHandled(
+            eventName, subEventName, requestId, response);
+      };
+      $Function.apply(cb, null, [details, handledCallback]);
+    };
+  }
+  $Array.push(this.subEvents,
+      {subEvent: subEvent, callback: cb, subEventCallback: subEventCallback});
+  subEvent.addListener(subEventCallback);
+};
+
+// Unregisters a callback.
+WebRequestEventImpl.prototype.removeListener = function(cb) {
+  var idx;
+  while ((idx = this.findListener_(cb)) >= 0) {
+    var e = this.subEvents[idx];
+    e.subEvent.removeListener(e.subEventCallback);
+    if (e.subEvent.hasListeners()) {
+      console.error(
+          'Internal error: webRequest subEvent has orphaned listeners.');
+    }
+    $Array.splice(this.subEvents, idx, 1);
+  }
+};
+
+WebRequestEventImpl.prototype.findListener_ = function(cb) {
+  for (var i in this.subEvents) {
+    var e = this.subEvents[i];
+    if (e.callback === cb) {
+      if (e.subEvent.hasListener(e.subEventCallback))
+        return i;
+      console.error('Internal error: webRequest subEvent has no callback.');
+    }
+  }
+
+  return -1;
+};
+
+WebRequestEventImpl.prototype.addRules = function(rules, opt_cb) {
+  throw new Error('This event does not support rules.');
+};
+
+WebRequestEventImpl.prototype.removeRules =
+    function(ruleIdentifiers, opt_cb) {
+  throw new Error('This event does not support rules.');
+};
+
+WebRequestEventImpl.prototype.getRules = function(ruleIdentifiers, cb) {
+  throw new Error('This event does not support rules.');
+};
+
+function WebRequestEvent() {
+  privates(WebRequestEvent).constructPrivate(this, arguments);
+}
+
+// Our util code requires we construct a new WebRequestEvent via a call to
+// 'new WebRequestEvent', which wouldn't work well with calling a v8::Function.
+// Provide a wrapper for native bindings to call into.
+function createWebRequestEvent(eventName, opt_argSchemas, opt_extraArgSchemas,
+                               opt_eventOptions, opt_webViewInstanceId) {
+  return new WebRequestEvent(eventName, opt_argSchemas, opt_extraArgSchemas,
+                             opt_eventOptions, opt_webViewInstanceId);
+}
+
+utils.expose(WebRequestEvent, WebRequestEventImpl, {
+  functions: [
+    'hasListener',
+    'hasListeners',
+    'addListener',
+    'removeListener',
+    'addRules',
+    'removeRules',
+    'getRules',
+  ],
+});
+
+exports.$set('WebRequestEvent', WebRequestEvent);
+exports.$set('createWebRequestEvent', createWebRequestEvent);
+// Copyright (c) 2012 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+// Custom binding for the webRequestInternal API.
+
+var binding = apiBridge ||
+              require('binding').Binding.create('webRequestInternal');
+var sendRequest = bindingUtil ?
+    $Function.bind(bindingUtil.sendRequest, bindingUtil) :
+    require('sendRequest').sendRequest;
+
+binding.registerCustomHook(function(api) {
+  var apiFunctions = api.apiFunctions;
+
+  apiFunctions.setHandleRequest('addEventListener', function() {
+    var args = $Array.slice(arguments);
+    sendRequest('webRequestInternal.addEventListener', args,
+                bindingUtil ? undefined : this.definition.parameters,
+                {__proto__: null, forIOThread: true});
+  });
+
+  apiFunctions.setHandleRequest('eventHandled', function() {
+    var args = $Array.slice(arguments);
+    sendRequest('webRequestInternal.eventHandled', args,
+                bindingUtil ? undefined : this.definition.parameters,
+                {__proto__: null, forIOThread: true});
+  });
+});
+
+if (!apiBridge)
+  exports.$set('binding', binding.generate());
+// Copyright 2014 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+// Custom binding for the webViewRequest API.
+
+var binding = require('binding').Binding.create('webViewRequest');
+
+var declarativeWebRequestSchema =
+    requireNative('schema_registry').GetSchema('declarativeWebRequest');
+var utils = require('utils');
+var validate = require('schemaUtils').validate;
+
+binding.registerCustomHook(function(api) {
+  var webViewRequest = api.compiledApi;
+
+  // Returns the schema definition of type |typeId| defined in
+  // |declarativeWebRequestScheme.types|.
+  function getSchema(typeId) {
+    return utils.lookup(declarativeWebRequestSchema.types,
+                        'id',
+                        'declarativeWebRequest.' + typeId);
+  }
+
+  // Helper function for the constructor of concrete datatypes of the
+  // declarative webRequest API.
+  // Makes sure that |this| contains the union of parameters and
+  // {'instanceType': 'declarativeWebRequest.' + typeId} and validates the
+  // generated union dictionary against the schema for |typeId|.
+  function setupInstance(instance, parameters, typeId) {
+    for (var key in parameters) {
+      if ($Object.hasOwnProperty(parameters, key)) {
+        instance[key] = parameters[key];
+      }
+    }
+
+    instance.instanceType = 'declarativeWebRequest.' + typeId;
+    var schema = getSchema(typeId);
+    validate([instance], [schema]);
+  }
+
+  // Setup all data types for the declarative webRequest API from the schema.
+  for (var i = 0; i < declarativeWebRequestSchema.types.length; ++i) {
+    var typeSchema = declarativeWebRequestSchema.types[i];
+    var typeId = typeSchema.id.replace('declarativeWebRequest.', '');
+    var action = function(typeId) {
+      return function(parameters) {
+        setupInstance(this, parameters, typeId);
+      };
+    }(typeId);
+    webViewRequest[typeId] = action;
+  }
+});
+
+exports.$set('binding', binding.generate());
+// Copyright 2014 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+var normalizeArgumentsAndValidate =
+    require('schemaUtils').normalizeArgumentsAndValidate
+var sendRequest = require('sendRequest').sendRequest;
+
+function extendSchema(schema) {
+  var extendedSchema = $Array.slice(schema);
+  $Array.unshift(extendedSchema, {'type': 'string'});
+  return extendedSchema;
+}
+
+// TODO(devlin): Combine parts of this and other custom types (ChromeSetting,
+// ContentSetting, etc).
+function StorageArea(namespace, schema) {
+  // Binds an API function for a namespace to its browser-side call, e.g.
+  // storage.sync.get('foo') -> (binds to) ->
+  // storage.get('sync', 'foo').
+  var self = this;
+  function bindApiFunction(functionName) {
+    var rawFunSchema =
+        $Array.filter(schema.functions,
+                      function(f) { return f.name === functionName; })[0];
+    // normalizeArgumentsAndValidate expects a function schema of the form
+    // { name: <name>, definition: <definition> }.
+    var funSchema = {
+      __proto__: null,
+      name: rawFunSchema.name,
+      definition: rawFunSchema
+    };
+    self[functionName] = function() {
+      var args = $Array.slice(arguments);
+      args = normalizeArgumentsAndValidate(args, funSchema);
+      return sendRequest(
+          'storage.' + functionName,
+          $Array.concat([namespace], args),
+          extendSchema(funSchema.definition.parameters),
+          {__proto__: null, preserveNullInObjects: true});
+    };
+  }
+  var apiFunctions = ['get', 'set', 'remove', 'clear', 'getBytesInUse'];
+  $Array.forEach(apiFunctions, bindApiFunction);
+}
+
+exports.$set('StorageArea', StorageArea);
+/*
+ * Copyright 2014 The Chromium Authors. All rights reserved.
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ *
+ * A style sheet for Chrome apps.
+ */
+
+@namespace "http://www.w3.org/1999/xhtml";
+
+body {
+  -webkit-user-select: none;
+  cursor: default;
+  font-family: $FONTFAMILY;
+  font-size: $FONTSIZE;
+}
+
+webview, appview {
+  display: inline-block;
+  width: 300px;
+  height: 300px;
+}
+
+html, body {
+  overflow: hidden;
+}
+
+img, a {
+  -webkit-user-drag: none;
+}
+
+[contenteditable], input {
+  -webkit-user-select: auto;
+}
+
+// Copyright 2014 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+var logging = requireNative('logging');
+
+/**
+ * Returns a function that logs a 'not available' error to the console and
+ * returns undefined.
+ *
+ * @param {string} messagePrefix text to prepend to the exception message.
+ */
+function generateDisabledMethodStub(messagePrefix, opt_messageSuffix) {
+  var message = messagePrefix + ' is not available in packaged apps.';
+  if (opt_messageSuffix) message = message + ' ' + opt_messageSuffix;
+  return function() {
+    console.error(message);
+    return;
+  };
+}
+
+/**
+ * Returns a function that throws a 'not available' error.
+ *
+ * @param {string} messagePrefix text to prepend to the exception message.
+ */
+function generateThrowingMethodStub(messagePrefix, opt_messageSuffix) {
+  var message = messagePrefix + ' is not available in packaged apps.';
+  if (opt_messageSuffix) message = message + ' ' + opt_messageSuffix;
+  return function() {
+    throw new Error(message);
+  };
+}
+
+/**
+ * Replaces the given methods of the passed in object with stubs that log
+ * 'not available' errors to the console and return undefined.
+ *
+ * This should be used on methods attached via non-configurable properties,
+ * such as window.alert. disableGetters should be used when possible, because
+ * it is friendlier towards feature detection.
+ *
+ * In most cases, the useThrowingStubs should be false, so the stubs used to
+ * replace the methods log an error to the console, but allow the calling code
+ * to continue. We shouldn't break library code that uses feature detection
+ * responsibly, such as:
+ *     if(window.confirm) {
+ *       var result = window.confirm('Are you sure you want to delete ...?');
+ *       ...
+ *     }
+ *
+ * useThrowingStubs should only be true for methods that are deprecated in the
+ * Web platform, and should not be used by a responsible library, even in
+ * conjunction with feature detection. A great example is document.write(), as
+ * the HTML5 specification recommends against using it, and says that its
+ * behavior is unreliable. No reasonable library code should ever use it.
+ * HTML5 spec: http://www.w3.org/TR/html5/dom.html#dom-document-write
+ *
+ * @param {Object} object The object with methods to disable. The prototype is
+ *     preferred.
+ * @param {string} objectName The display name to use in the error message
+ *     thrown by the stub (this is the name that the object is commonly referred
+ *     to by web developers, e.g. "document" instead of "HTMLDocument").
+ * @param {Array<string>} methodNames names of methods to disable.
+ * @param {Boolean} useThrowingStubs if true, the replaced methods will throw
+ *     an error instead of silently returning undefined
+ */
+function disableMethods(object, objectName, methodNames, useThrowingStubs) {
+  $Array.forEach(methodNames, function(methodName) {
+    logging.DCHECK($Object.getOwnPropertyDescriptor(object, methodName),
+                   objectName + ': ' + methodName);
+    var messagePrefix = objectName + '.' + methodName + '()';
+    $Object.defineProperty(object, methodName, {
+      configurable: false,
+      enumerable: false,
+      value: useThrowingStubs ?
+                 generateThrowingMethodStub(messagePrefix) :
+                 generateDisabledMethodStub(messagePrefix)
+    });
+  });
+}
+
+/**
+ * Replaces the given properties of the passed in object with stubs that log
+ * 'not available' warnings to the console and return undefined when gotten. If
+ * a property's setter is later invoked, the getter and setter are restored to
+ * default behaviors.
+ *
+ * @param {Object} object The object with properties to disable. The prototype
+ *     is preferred.
+ * @param {string} objectName The display name to use in the error message
+ *     thrown by the getter stub (this is the name that the object is commonly
+ *     referred to by web developers, e.g. "document" instead of
+ *     "HTMLDocument").
+ * @param {Array<string>} propertyNames names of properties to disable.
+ * @param {?string=} opt_messageSuffix An optional suffix for the message.
+ * @param {boolean=} opt_ignoreMissingProperty True if we allow disabling
+ *     getters for non-existent properties.
+ */
+function disableGetters(object, objectName, propertyNames, opt_messageSuffix,
+                        opt_ignoreMissingProperty) {
+  $Array.forEach(propertyNames, function(propertyName) {
+    logging.DCHECK(opt_ignoreMissingProperty ||
+                       $Object.getOwnPropertyDescriptor(object, propertyName),
+                   objectName + ': ' + propertyName);
+    var stub = generateDisabledMethodStub(objectName + '.' + propertyName,
+                                          opt_messageSuffix);
+    stub._is_platform_app_disabled_getter = true;
+    $Object.defineProperty(object, propertyName, {
+      configurable: true,
+      enumerable: false,
+      get: stub,
+      set: function(value) {
+        var descriptor = $Object.getOwnPropertyDescriptor(this, propertyName);
+        if (!descriptor || !descriptor.get ||
+            descriptor.get._is_platform_app_disabled_getter) {
+          // The stub getter is still defined.  Blow-away the property to
+          // restore default getter/setter behaviors and re-create it with the
+          // given value.
+          delete this[propertyName];
+          this[propertyName] = value;
+        } else {
+          // Do nothing.  If some custom getter (not ours) has been defined,
+          // there would be no way to read back the value stored by a default
+          // setter. Also, the only way to clear a custom getter is to first
+          // delete the property.  Therefore, the value we have here should
+          // just go into a black hole.
+        }
+      }
+    });
+  });
+}
+
+/**
+ * Replaces the given properties of the passed in object with stubs that log
+ * 'not available' warnings to the console when set.
+ *
+ * @param {Object} object The object with properties to disable. The prototype
+ *     is preferred.
+ * @param {string} objectName The display name to use in the error message
+ *     thrown by the setter stub (this is the name that the object is commonly
+ *     referred to by web developers, e.g. "document" instead of
+ *     "HTMLDocument").
+ * @param {Array<string>} propertyNames names of properties to disable.
+ */
+function disableSetters(object, objectName, propertyNames, opt_messageSuffix) {
+  $Array.forEach(propertyNames, function(propertyName) {
+    logging.DCHECK($Object.getOwnPropertyDescriptor(object, propertyName),
+                   objectName + ': ' + propertyName);
+    var stub = generateDisabledMethodStub(objectName + '.' + propertyName,
+                                          opt_messageSuffix);
+    $Object.defineProperty(object, propertyName, {
+      configurable: false,
+      enumerable: false,
+      get: function() {
+        return;
+      },
+      set: stub
+    });
+  });
+}
+
+// Disable benign Document methods.
+disableMethods(Document.prototype, 'document', ['open', 'close']);
+disableMethods(HTMLDocument.prototype, 'document', ['clear']);
+
+// Replace evil Document methods with exception-throwing stubs.
+disableMethods(Document.prototype, 'document', ['write', 'writeln'], true);
+
+// Disable history.
+Object.defineProperty(window, "history", { value: {} });
+// Note: we just blew away the history object, so we need to ignore the fact
+// that these properties aren't defined on the object.
+disableGetters(window.history, 'history',
+    ['back', 'forward', 'go', 'length', 'pushState', 'replaceState', 'state'],
+    null, true);
+
+// Disable find.
+disableMethods(window, 'window', ['find']);
+
+// Disable modal dialogs. Shell windows disable these anyway, but it's nice to
+// warn.
+disableMethods(window, 'window', ['alert', 'confirm', 'prompt']);
+
+// Disable window.*bar.
+disableGetters(window, 'window',
+    ['locationbar', 'menubar', 'personalbar', 'scrollbars', 'statusbar',
+     'toolbar']);
+
+// Disable window.localStorage.
+// Sometimes DOM security policy prevents us from doing this (e.g. for data:
+// URLs) so wrap in try-catch.
+try {
+  disableGetters(window, 'window',
+      ['localStorage'],
+      'Use chrome.storage.local instead.');
+} catch (e) {}
+
+// Document instance properties that we wish to disable need to be set when
+// the document begins loading, since only then will the "document" reference
+// point to the page's document (it will be reset between now and then).
+// We can't listen for the "readystatechange" event on the document (because
+// the object that it's dispatched on doesn't exist yet), but we can instead
+// do it at the window level in the capturing phase.
+window.addEventListener('readystatechange', function(event) {
+  if (document.readyState != 'loading')
+    return;
+
+  // Deprecated document properties from
+  // https://developer.mozilla.org/en/DOM/document.
+  // To deprecate document.all, simply changing its getter and setter would
+  // activate its cache mechanism, and degrade the performance. Here we assign
+  // it first to 'undefined' to avoid this.
+  document.all = undefined;
+  disableGetters(document, 'document',
+      ['alinkColor', 'all', 'bgColor', 'fgColor', 'linkColor', 'vlinkColor'],
+      null, true);
+}, true);
+
+// Disable onunload, onbeforeunload.
+disableSetters(window, 'window', ['onbeforeunload', 'onunload']);
+var eventTargetAddEventListener = EventTarget.prototype.addEventListener;
+EventTarget.prototype.addEventListener = function(type) {
+  var args = $Array.slice(arguments);
+  // Note: Force conversion to a string in order to catch any funny attempts
+  // to pass in something that evals to 'unload' but wouldn't === 'unload'.
+  var type = (args[0] += '');
+  if (type === 'unload' || type === 'beforeunload')
+    generateDisabledMethodStub(type)();
+  else
+    return $Function.apply(eventTargetAddEventListener, this, args);
+};
+/*
+ * Copyright 2014 The Chromium Authors. All rights reserved.
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ *
+ * This stylesheet is used to apply Chrome system fonts to all extension pages.
+ */
+
+body {
+  font-family: $FONTFAMILY;
+  font-size: $FONTSIZE;
+}
+// Copyright 2014 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+define("chrome/browser/media/router/mojo/media_controller.mojom", [
+    "mojo/public/js/associated_bindings",
+    "mojo/public/js/bindings",
+    "mojo/public/js/codec",
+    "mojo/public/js/core",
+    "mojo/public/js/validator",
+    "chrome/browser/media/router/mojo/media_status.mojom",
+    "mojo/common/time.mojom",
+], function(associatedBindings, bindings, codec, core, validator, media_status$, time$) {
+
+  function MediaController_Play_Params(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaController_Play_Params.prototype.initDefaults_ = function() {
+  };
+  MediaController_Play_Params.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaController_Play_Params.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 8}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    return validator.validationError.NONE;
+  };
+
+  MediaController_Play_Params.encodedSize = codec.kStructHeaderSize + 0;
+
+  MediaController_Play_Params.decode = function(decoder) {
+    var packed;
+    var val = new MediaController_Play_Params();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    return val;
+  };
+
+  MediaController_Play_Params.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaController_Play_Params.encodedSize);
+    encoder.writeUint32(0);
+  };
+  function MediaController_Pause_Params(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaController_Pause_Params.prototype.initDefaults_ = function() {
+  };
+  MediaController_Pause_Params.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaController_Pause_Params.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 8}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    return validator.validationError.NONE;
+  };
+
+  MediaController_Pause_Params.encodedSize = codec.kStructHeaderSize + 0;
+
+  MediaController_Pause_Params.decode = function(decoder) {
+    var packed;
+    var val = new MediaController_Pause_Params();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    return val;
+  };
+
+  MediaController_Pause_Params.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaController_Pause_Params.encodedSize);
+    encoder.writeUint32(0);
+  };
+  function MediaController_SetMute_Params(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaController_SetMute_Params.prototype.initDefaults_ = function() {
+    this.mute = false;
+  };
+  MediaController_SetMute_Params.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaController_SetMute_Params.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 16}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    return validator.validationError.NONE;
+  };
+
+  MediaController_SetMute_Params.encodedSize = codec.kStructHeaderSize + 8;
+
+  MediaController_SetMute_Params.decode = function(decoder) {
+    var packed;
+    var val = new MediaController_SetMute_Params();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    packed = decoder.readUint8();
+    val.mute = (packed >> 0) & 1 ? true : false;
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    return val;
+  };
+
+  MediaController_SetMute_Params.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaController_SetMute_Params.encodedSize);
+    encoder.writeUint32(0);
+    packed = 0;
+    packed |= (val.mute & 1) << 0
+    encoder.writeUint8(packed);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+  };
+  function MediaController_SetVolume_Params(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaController_SetVolume_Params.prototype.initDefaults_ = function() {
+    this.volume = 0;
+  };
+  MediaController_SetVolume_Params.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaController_SetVolume_Params.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 16}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    return validator.validationError.NONE;
+  };
+
+  MediaController_SetVolume_Params.encodedSize = codec.kStructHeaderSize + 8;
+
+  MediaController_SetVolume_Params.decode = function(decoder) {
+    var packed;
+    var val = new MediaController_SetVolume_Params();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    val.volume = decoder.decodeStruct(codec.Float);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    return val;
+  };
+
+  MediaController_SetVolume_Params.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaController_SetVolume_Params.encodedSize);
+    encoder.writeUint32(0);
+    encoder.encodeStruct(codec.Float, val.volume);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+  };
+  function MediaController_Seek_Params(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaController_Seek_Params.prototype.initDefaults_ = function() {
+    this.time = null;
+  };
+  MediaController_Seek_Params.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaController_Seek_Params.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 16}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaController_Seek_Params.time
+    err = messageValidator.validateStructPointer(offset + codec.kStructHeaderSize + 0, time$.TimeDelta, false);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    return validator.validationError.NONE;
+  };
+
+  MediaController_Seek_Params.encodedSize = codec.kStructHeaderSize + 8;
+
+  MediaController_Seek_Params.decode = function(decoder) {
+    var packed;
+    var val = new MediaController_Seek_Params();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    val.time = decoder.decodeStructPointer(time$.TimeDelta);
+    return val;
+  };
+
+  MediaController_Seek_Params.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaController_Seek_Params.encodedSize);
+    encoder.writeUint32(0);
+    encoder.encodeStructPointer(time$.TimeDelta, val.time);
+  };
+  var kMediaController_Play_Name = 0;
+  var kMediaController_Pause_Name = 1;
+  var kMediaController_SetMute_Name = 2;
+  var kMediaController_SetVolume_Name = 3;
+  var kMediaController_Seek_Name = 4;
+
+  function MediaControllerPtr(handleOrPtrInfo) {
+    this.ptr = new bindings.InterfacePtrController(MediaController,
+                                                   handleOrPtrInfo);
+  }
+
+  function MediaControllerProxy(receiver) {
+    this.receiver_ = receiver;
+  }
+  MediaControllerPtr.prototype.play = function() {
+    return MediaControllerProxy.prototype.play
+        .apply(this.ptr.getProxy(), arguments);
+  };
+
+  MediaControllerProxy.prototype.play = function() {
+    var params = new MediaController_Play_Params();
+    var builder = new codec.MessageBuilder(
+        kMediaController_Play_Name,
+        codec.align(MediaController_Play_Params.encodedSize));
+    builder.encodeStruct(MediaController_Play_Params, params);
+    var message = builder.finish();
+    this.receiver_.accept(message);
+  };
+  MediaControllerPtr.prototype.pause = function() {
+    return MediaControllerProxy.prototype.pause
+        .apply(this.ptr.getProxy(), arguments);
+  };
+
+  MediaControllerProxy.prototype.pause = function() {
+    var params = new MediaController_Pause_Params();
+    var builder = new codec.MessageBuilder(
+        kMediaController_Pause_Name,
+        codec.align(MediaController_Pause_Params.encodedSize));
+    builder.encodeStruct(MediaController_Pause_Params, params);
+    var message = builder.finish();
+    this.receiver_.accept(message);
+  };
+  MediaControllerPtr.prototype.setMute = function() {
+    return MediaControllerProxy.prototype.setMute
+        .apply(this.ptr.getProxy(), arguments);
+  };
+
+  MediaControllerProxy.prototype.setMute = function(mute) {
+    var params = new MediaController_SetMute_Params();
+    params.mute = mute;
+    var builder = new codec.MessageBuilder(
+        kMediaController_SetMute_Name,
+        codec.align(MediaController_SetMute_Params.encodedSize));
+    builder.encodeStruct(MediaController_SetMute_Params, params);
+    var message = builder.finish();
+    this.receiver_.accept(message);
+  };
+  MediaControllerPtr.prototype.setVolume = function() {
+    return MediaControllerProxy.prototype.setVolume
+        .apply(this.ptr.getProxy(), arguments);
+  };
+
+  MediaControllerProxy.prototype.setVolume = function(volume) {
+    var params = new MediaController_SetVolume_Params();
+    params.volume = volume;
+    var builder = new codec.MessageBuilder(
+        kMediaController_SetVolume_Name,
+        codec.align(MediaController_SetVolume_Params.encodedSize));
+    builder.encodeStruct(MediaController_SetVolume_Params, params);
+    var message = builder.finish();
+    this.receiver_.accept(message);
+  };
+  MediaControllerPtr.prototype.seek = function() {
+    return MediaControllerProxy.prototype.seek
+        .apply(this.ptr.getProxy(), arguments);
+  };
+
+  MediaControllerProxy.prototype.seek = function(time) {
+    var params = new MediaController_Seek_Params();
+    params.time = time;
+    var builder = new codec.MessageBuilder(
+        kMediaController_Seek_Name,
+        codec.align(MediaController_Seek_Params.encodedSize));
+    builder.encodeStruct(MediaController_Seek_Params, params);
+    var message = builder.finish();
+    this.receiver_.accept(message);
+  };
+
+  function MediaControllerStub(delegate) {
+    this.delegate_ = delegate;
+  }
+  MediaControllerStub.prototype.play = function() {
+    return this.delegate_ && this.delegate_.play && this.delegate_.play();
+  }
+  MediaControllerStub.prototype.pause = function() {
+    return this.delegate_ && this.delegate_.pause && this.delegate_.pause();
+  }
+  MediaControllerStub.prototype.setMute = function(mute) {
+    return this.delegate_ && this.delegate_.setMute && this.delegate_.setMute(mute);
+  }
+  MediaControllerStub.prototype.setVolume = function(volume) {
+    return this.delegate_ && this.delegate_.setVolume && this.delegate_.setVolume(volume);
+  }
+  MediaControllerStub.prototype.seek = function(time) {
+    return this.delegate_ && this.delegate_.seek && this.delegate_.seek(time);
+  }
+
+  MediaControllerStub.prototype.accept = function(message) {
+    var reader = new codec.MessageReader(message);
+    switch (reader.messageName) {
+    case kMediaController_Play_Name:
+      var params = reader.decodeStruct(MediaController_Play_Params);
+      this.play();
+      return true;
+    case kMediaController_Pause_Name:
+      var params = reader.decodeStruct(MediaController_Pause_Params);
+      this.pause();
+      return true;
+    case kMediaController_SetMute_Name:
+      var params = reader.decodeStruct(MediaController_SetMute_Params);
+      this.setMute(params.mute);
+      return true;
+    case kMediaController_SetVolume_Name:
+      var params = reader.decodeStruct(MediaController_SetVolume_Params);
+      this.setVolume(params.volume);
+      return true;
+    case kMediaController_Seek_Name:
+      var params = reader.decodeStruct(MediaController_Seek_Params);
+      this.seek(params.time);
+      return true;
+    default:
+      return false;
+    }
+  };
+
+  MediaControllerStub.prototype.acceptWithResponder =
+      function(message, responder) {
+    var reader = new codec.MessageReader(message);
+    switch (reader.messageName) {
+    default:
+      return false;
+    }
+  };
+
+  function validateMediaControllerRequest(messageValidator) {
+    var message = messageValidator.message;
+    var paramsClass = null;
+    switch (message.getName()) {
+      case kMediaController_Play_Name:
+        if (!message.expectsResponse() && !message.isResponse())
+          paramsClass = MediaController_Play_Params;
+      break;
+      case kMediaController_Pause_Name:
+        if (!message.expectsResponse() && !message.isResponse())
+          paramsClass = MediaController_Pause_Params;
+      break;
+      case kMediaController_SetMute_Name:
+        if (!message.expectsResponse() && !message.isResponse())
+          paramsClass = MediaController_SetMute_Params;
+      break;
+      case kMediaController_SetVolume_Name:
+        if (!message.expectsResponse() && !message.isResponse())
+          paramsClass = MediaController_SetVolume_Params;
+      break;
+      case kMediaController_Seek_Name:
+        if (!message.expectsResponse() && !message.isResponse())
+          paramsClass = MediaController_Seek_Params;
+      break;
+    }
+    if (paramsClass === null)
+      return validator.validationError.NONE;
+    return paramsClass.validate(messageValidator, messageValidator.message.getHeaderNumBytes());
+  }
+
+  function validateMediaControllerResponse(messageValidator) {
+    return validator.validationError.NONE;
+  }
+
+  var MediaController = {
+    name: 'media_router::mojom::MediaController',
+    kVersion: 0,
+    ptrClass: MediaControllerPtr,
+    proxyClass: MediaControllerProxy,
+    stubClass: MediaControllerStub,
+    validateRequest: validateMediaControllerRequest,
+    validateResponse: null,
+  };
+  MediaControllerStub.prototype.validator = validateMediaControllerRequest;
+  MediaControllerProxy.prototype.validator = null;
+  var exports = {};
+  exports.MediaController = MediaController;
+  exports.MediaControllerPtr = MediaControllerPtr;
+
+  return exports;
+});// Copyright 2014 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+define("chrome/browser/media/router/mojo/media_router.mojom", [
+    "mojo/public/js/associated_bindings",
+    "mojo/public/js/bindings",
+    "mojo/public/js/codec",
+    "mojo/public/js/core",
+    "mojo/public/js/validator",
+    "mojo/common/time.mojom",
+    "net/interfaces/ip_address.mojom",
+    "url/mojo/origin.mojom",
+    "url/mojo/url.mojom",
+], function(associatedBindings, bindings, codec, core, validator, time$, ip_address$, origin$, url$) {
+  var RouteRequestResultCode = {};
+  RouteRequestResultCode.UNKNOWN_ERROR = 0;
+  RouteRequestResultCode.OK = RouteRequestResultCode.UNKNOWN_ERROR + 1;
+  RouteRequestResultCode.TIMED_OUT = RouteRequestResultCode.OK + 1;
+  RouteRequestResultCode.ROUTE_NOT_FOUND = RouteRequestResultCode.TIMED_OUT + 1;
+  RouteRequestResultCode.SINK_NOT_FOUND = RouteRequestResultCode.ROUTE_NOT_FOUND + 1;
+  RouteRequestResultCode.INVALID_ORIGIN = RouteRequestResultCode.SINK_NOT_FOUND + 1;
+  RouteRequestResultCode.INCOGNITO_MISMATCH = RouteRequestResultCode.INVALID_ORIGIN + 1;
+  RouteRequestResultCode.NO_SUPPORTED_PROVIDER = RouteRequestResultCode.INCOGNITO_MISMATCH + 1;
+  RouteRequestResultCode.CANCELLED = RouteRequestResultCode.NO_SUPPORTED_PROVIDER + 1;
+
+  RouteRequestResultCode.isKnownEnumValue = function(value) {
+    switch (value) {
+    case 0:
+    case 1:
+    case 2:
+    case 3:
+    case 4:
+    case 5:
+    case 6:
+    case 7:
+    case 8:
+      return true;
+    }
+    return false;
+  };
+
+  RouteRequestResultCode.validate = function(enumValue) {
+    var isExtensible = false;
+    if (isExtensible || this.isKnownEnumValue(enumValue))
+      return validator.validationError.NONE;
+
+    return validator.validationError.UNKNOWN_ENUM_VALUE;
+  };
+
+  function MediaSink(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+  MediaSink.IconType = {};
+  MediaSink.IconType.CAST = 0;
+  MediaSink.IconType.CAST_AUDIO = MediaSink.IconType.CAST + 1;
+  MediaSink.IconType.CAST_AUDIO_GROUP = MediaSink.IconType.CAST_AUDIO + 1;
+  MediaSink.IconType.MEETING = MediaSink.IconType.CAST_AUDIO_GROUP + 1;
+  MediaSink.IconType.HANGOUT = MediaSink.IconType.MEETING + 1;
+  MediaSink.IconType.GENERIC = MediaSink.IconType.HANGOUT + 1;
+
+  MediaSink.IconType.isKnownEnumValue = function(value) {
+    switch (value) {
+    case 0:
+    case 1:
+    case 2:
+    case 3:
+    case 4:
+    case 5:
+      return true;
+    }
+    return false;
+  };
+
+  MediaSink.IconType.validate = function(enumValue) {
+    var isExtensible = false;
+    if (isExtensible || this.isKnownEnumValue(enumValue))
+      return validator.validationError.NONE;
+
+    return validator.validationError.UNKNOWN_ENUM_VALUE;
+  };
+
+  MediaSink.prototype.initDefaults_ = function() {
+    this.sink_id = null;
+    this.name = null;
+    this.description = null;
+    this.domain = null;
+    this.icon_type = 0;
+    this.extra_data = null;
+  };
+  MediaSink.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaSink.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 64}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaSink.sink_id
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 0, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaSink.name
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 8, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaSink.description
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 16, true)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaSink.domain
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 24, true)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaSink.icon_type
+    err = messageValidator.validateEnum(offset + codec.kStructHeaderSize + 32, MediaSink.IconType);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    // validate MediaSink.extra_data
+    err = messageValidator.validateUnion(offset + codec.kStructHeaderSize + 40, MediaSinkExtraData, true);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    return validator.validationError.NONE;
+  };
+
+  MediaSink.encodedSize = codec.kStructHeaderSize + 56;
+
+  MediaSink.decode = function(decoder) {
+    var packed;
+    var val = new MediaSink();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    val.sink_id = decoder.decodeStruct(codec.String);
+    val.name = decoder.decodeStruct(codec.String);
+    val.description = decoder.decodeStruct(codec.NullableString);
+    val.domain = decoder.decodeStruct(codec.NullableString);
+    val.icon_type = decoder.decodeStruct(codec.Int32);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    val.extra_data = decoder.decodeStruct(MediaSinkExtraData);
+    return val;
+  };
+
+  MediaSink.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaSink.encodedSize);
+    encoder.writeUint32(0);
+    encoder.encodeStruct(codec.String, val.sink_id);
+    encoder.encodeStruct(codec.String, val.name);
+    encoder.encodeStruct(codec.NullableString, val.description);
+    encoder.encodeStruct(codec.NullableString, val.domain);
+    encoder.encodeStruct(codec.Int32, val.icon_type);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.encodeStruct(MediaSinkExtraData, val.extra_data);
+  };
+  function DialMediaSink(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  DialMediaSink.prototype.initDefaults_ = function() {
+    this.ip_address = null;
+    this.model_name = null;
+    this.app_url = null;
+  };
+  DialMediaSink.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  DialMediaSink.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 32}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate DialMediaSink.ip_address
+    err = messageValidator.validateStructPointer(offset + codec.kStructHeaderSize + 0, ip_address$.IPAddress, false);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate DialMediaSink.model_name
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 8, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate DialMediaSink.app_url
+    err = messageValidator.validateStructPointer(offset + codec.kStructHeaderSize + 16, url$.Url, false);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    return validator.validationError.NONE;
+  };
+
+  DialMediaSink.encodedSize = codec.kStructHeaderSize + 24;
+
+  DialMediaSink.decode = function(decoder) {
+    var packed;
+    var val = new DialMediaSink();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    val.ip_address = decoder.decodeStructPointer(ip_address$.IPAddress);
+    val.model_name = decoder.decodeStruct(codec.String);
+    val.app_url = decoder.decodeStructPointer(url$.Url);
+    return val;
+  };
+
+  DialMediaSink.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(DialMediaSink.encodedSize);
+    encoder.writeUint32(0);
+    encoder.encodeStructPointer(ip_address$.IPAddress, val.ip_address);
+    encoder.encodeStruct(codec.String, val.model_name);
+    encoder.encodeStructPointer(url$.Url, val.app_url);
+  };
+  function CastMediaSink(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  CastMediaSink.prototype.initDefaults_ = function() {
+    this.ip_address = null;
+    this.model_name = null;
+    this.capabilities = 0;
+    this.cast_channel_id = 0;
+  };
+  CastMediaSink.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  CastMediaSink.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 32}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate CastMediaSink.ip_address
+    err = messageValidator.validateStructPointer(offset + codec.kStructHeaderSize + 0, ip_address$.IPAddress, false);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate CastMediaSink.model_name
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 8, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+
+    return validator.validationError.NONE;
+  };
+
+  CastMediaSink.encodedSize = codec.kStructHeaderSize + 24;
+
+  CastMediaSink.decode = function(decoder) {
+    var packed;
+    var val = new CastMediaSink();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    val.ip_address = decoder.decodeStructPointer(ip_address$.IPAddress);
+    val.model_name = decoder.decodeStruct(codec.String);
+    val.capabilities = decoder.decodeStruct(codec.Uint8);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    val.cast_channel_id = decoder.decodeStruct(codec.Int32);
+    return val;
+  };
+
+  CastMediaSink.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(CastMediaSink.encodedSize);
+    encoder.writeUint32(0);
+    encoder.encodeStructPointer(ip_address$.IPAddress, val.ip_address);
+    encoder.encodeStruct(codec.String, val.model_name);
+    encoder.encodeStruct(codec.Uint8, val.capabilities);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.encodeStruct(codec.Int32, val.cast_channel_id);
+  };
+  function MediaRoute(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaRoute.prototype.initDefaults_ = function() {
+    this.media_route_id = null;
+    this.media_source = null;
+    this.media_sink_id = null;
+    this.description = null;
+    this.is_local = false;
+    this.for_display = false;
+    this.is_incognito = false;
+    this.is_offscreen_presentation = false;
+    this.custom_controller_path = null;
+  };
+  MediaRoute.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaRoute.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 56}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRoute.media_route_id
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 0, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRoute.media_source
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 8, true)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRoute.media_sink_id
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 16, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRoute.description
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 24, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+
+    
+    // validate MediaRoute.custom_controller_path
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 40, true)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+
+
+    return validator.validationError.NONE;
+  };
+
+  MediaRoute.encodedSize = codec.kStructHeaderSize + 48;
+
+  MediaRoute.decode = function(decoder) {
+    var packed;
+    var val = new MediaRoute();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    val.media_route_id = decoder.decodeStruct(codec.String);
+    val.media_source = decoder.decodeStruct(codec.NullableString);
+    val.media_sink_id = decoder.decodeStruct(codec.String);
+    val.description = decoder.decodeStruct(codec.String);
+    packed = decoder.readUint8();
+    val.is_local = (packed >> 0) & 1 ? true : false;
+    val.for_display = (packed >> 1) & 1 ? true : false;
+    val.is_incognito = (packed >> 2) & 1 ? true : false;
+    val.is_offscreen_presentation = (packed >> 3) & 1 ? true : false;
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    val.custom_controller_path = decoder.decodeStruct(codec.NullableString);
+    return val;
+  };
+
+  MediaRoute.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaRoute.encodedSize);
+    encoder.writeUint32(0);
+    encoder.encodeStruct(codec.String, val.media_route_id);
+    encoder.encodeStruct(codec.NullableString, val.media_source);
+    encoder.encodeStruct(codec.String, val.media_sink_id);
+    encoder.encodeStruct(codec.String, val.description);
+    packed = 0;
+    packed |= (val.is_local & 1) << 0
+    packed |= (val.for_display & 1) << 1
+    packed |= (val.is_incognito & 1) << 2
+    packed |= (val.is_offscreen_presentation & 1) << 3
+    encoder.writeUint8(packed);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.encodeStruct(codec.NullableString, val.custom_controller_path);
+  };
+  function Issue(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+  Issue.Severity = {};
+  Issue.Severity.FATAL = 0;
+  Issue.Severity.WARNING = Issue.Severity.FATAL + 1;
+  Issue.Severity.NOTIFICATION = Issue.Severity.WARNING + 1;
+
+  Issue.Severity.isKnownEnumValue = function(value) {
+    switch (value) {
+    case 0:
+    case 1:
+    case 2:
+      return true;
+    }
+    return false;
+  };
+
+  Issue.Severity.validate = function(enumValue) {
+    var isExtensible = false;
+    if (isExtensible || this.isKnownEnumValue(enumValue))
+      return validator.validationError.NONE;
+
+    return validator.validationError.UNKNOWN_ENUM_VALUE;
+  };
+  Issue.ActionType = {};
+  Issue.ActionType.DISMISS = 0;
+  Issue.ActionType.LEARN_MORE = Issue.ActionType.DISMISS + 1;
+
+  Issue.ActionType.isKnownEnumValue = function(value) {
+    switch (value) {
+    case 0:
+    case 1:
+      return true;
+    }
+    return false;
+  };
+
+  Issue.ActionType.validate = function(enumValue) {
+    var isExtensible = false;
+    if (isExtensible || this.isKnownEnumValue(enumValue))
+      return validator.validationError.NONE;
+
+    return validator.validationError.UNKNOWN_ENUM_VALUE;
+  };
+
+  Issue.prototype.initDefaults_ = function() {
+    this.route_id = null;
+    this.severity = 0;
+    this.is_blocking = false;
+    this.title = null;
+    this.message = null;
+    this.default_action = 0;
+    this.help_page_id = 0;
+    this.secondary_actions = null;
+  };
+  Issue.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  Issue.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 56}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate Issue.route_id
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 0, true)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate Issue.severity
+    err = messageValidator.validateEnum(offset + codec.kStructHeaderSize + 8, Issue.Severity);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+
+    
+    // validate Issue.title
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 16, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate Issue.message
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 24, true)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate Issue.default_action
+    err = messageValidator.validateEnum(offset + codec.kStructHeaderSize + 32, Issue.ActionType);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate Issue.secondary_actions
+    err = messageValidator.validateArrayPointer(offset + codec.kStructHeaderSize + 40, 4, new codec.Enum(Issue.ActionType), true, [0], 0);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    return validator.validationError.NONE;
+  };
+
+  Issue.encodedSize = codec.kStructHeaderSize + 48;
+
+  Issue.decode = function(decoder) {
+    var packed;
+    var val = new Issue();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    val.route_id = decoder.decodeStruct(codec.NullableString);
+    val.severity = decoder.decodeStruct(codec.Int32);
+    packed = decoder.readUint8();
+    val.is_blocking = (packed >> 0) & 1 ? true : false;
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    val.title = decoder.decodeStruct(codec.String);
+    val.message = decoder.decodeStruct(codec.NullableString);
+    val.default_action = decoder.decodeStruct(codec.Int32);
+    val.help_page_id = decoder.decodeStruct(codec.Int32);
+    val.secondary_actions = decoder.decodeArrayPointer(new codec.Enum(Issue.ActionType));
+    return val;
+  };
+
+  Issue.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(Issue.encodedSize);
+    encoder.writeUint32(0);
+    encoder.encodeStruct(codec.NullableString, val.route_id);
+    encoder.encodeStruct(codec.Int32, val.severity);
+    packed = 0;
+    packed |= (val.is_blocking & 1) << 0
+    encoder.writeUint8(packed);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.encodeStruct(codec.String, val.title);
+    encoder.encodeStruct(codec.NullableString, val.message);
+    encoder.encodeStruct(codec.Int32, val.default_action);
+    encoder.encodeStruct(codec.Int32, val.help_page_id);
+    encoder.encodeArrayPointer(new codec.Enum(Issue.ActionType), val.secondary_actions);
+  };
+  function RouteMessage(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+  RouteMessage.Type = {};
+  RouteMessage.Type.TEXT = 0;
+  RouteMessage.Type.BINARY = RouteMessage.Type.TEXT + 1;
+
+  RouteMessage.Type.isKnownEnumValue = function(value) {
+    switch (value) {
+    case 0:
+    case 1:
+      return true;
+    }
+    return false;
+  };
+
+  RouteMessage.Type.validate = function(enumValue) {
+    var isExtensible = false;
+    if (isExtensible || this.isKnownEnumValue(enumValue))
+      return validator.validationError.NONE;
+
+    return validator.validationError.UNKNOWN_ENUM_VALUE;
+  };
+
+  RouteMessage.prototype.initDefaults_ = function() {
+    this.type = 0;
+    this.message = null;
+    this.data = null;
+  };
+  RouteMessage.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  RouteMessage.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 32}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate RouteMessage.type
+    err = messageValidator.validateEnum(offset + codec.kStructHeaderSize + 0, RouteMessage.Type);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate RouteMessage.message
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 8, true)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate RouteMessage.data
+    err = messageValidator.validateArrayPointer(offset + codec.kStructHeaderSize + 16, 1, codec.Uint8, true, [0], 0);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    return validator.validationError.NONE;
+  };
+
+  RouteMessage.encodedSize = codec.kStructHeaderSize + 24;
+
+  RouteMessage.decode = function(decoder) {
+    var packed;
+    var val = new RouteMessage();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    val.type = decoder.decodeStruct(codec.Int32);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    val.message = decoder.decodeStruct(codec.NullableString);
+    val.data = decoder.decodeArrayPointer(codec.Uint8);
+    return val;
+  };
+
+  RouteMessage.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(RouteMessage.encodedSize);
+    encoder.writeUint32(0);
+    encoder.encodeStruct(codec.Int32, val.type);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.encodeStruct(codec.NullableString, val.message);
+    encoder.encodeArrayPointer(codec.Uint8, val.data);
+  };
+  function SinkSearchCriteria(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  SinkSearchCriteria.prototype.initDefaults_ = function() {
+    this.input = null;
+    this.domain = null;
+  };
+  SinkSearchCriteria.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  SinkSearchCriteria.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 24}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate SinkSearchCriteria.input
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 0, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate SinkSearchCriteria.domain
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 8, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    return validator.validationError.NONE;
+  };
+
+  SinkSearchCriteria.encodedSize = codec.kStructHeaderSize + 16;
+
+  SinkSearchCriteria.decode = function(decoder) {
+    var packed;
+    var val = new SinkSearchCriteria();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    val.input = decoder.decodeStruct(codec.String);
+    val.domain = decoder.decodeStruct(codec.String);
+    return val;
+  };
+
+  SinkSearchCriteria.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(SinkSearchCriteria.encodedSize);
+    encoder.writeUint32(0);
+    encoder.encodeStruct(codec.String, val.input);
+    encoder.encodeStruct(codec.String, val.domain);
+  };
+  function MediaRouteProvider_CreateRoute_Params(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaRouteProvider_CreateRoute_Params.prototype.initDefaults_ = function() {
+    this.media_source = null;
+    this.sink_id = null;
+    this.original_presentation_id = null;
+    this.origin = null;
+    this.tab_id = 0;
+    this.incognito = false;
+    this.timeout = null;
+  };
+  MediaRouteProvider_CreateRoute_Params.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaRouteProvider_CreateRoute_Params.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 56}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_CreateRoute_Params.media_source
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 0, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_CreateRoute_Params.sink_id
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 8, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_CreateRoute_Params.original_presentation_id
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 16, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_CreateRoute_Params.origin
+    err = messageValidator.validateStructPointer(offset + codec.kStructHeaderSize + 24, origin$.Origin, false);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+
+    
+    // validate MediaRouteProvider_CreateRoute_Params.timeout
+    err = messageValidator.validateStructPointer(offset + codec.kStructHeaderSize + 40, time$.TimeDelta, false);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    return validator.validationError.NONE;
+  };
+
+  MediaRouteProvider_CreateRoute_Params.encodedSize = codec.kStructHeaderSize + 48;
+
+  MediaRouteProvider_CreateRoute_Params.decode = function(decoder) {
+    var packed;
+    var val = new MediaRouteProvider_CreateRoute_Params();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    val.media_source = decoder.decodeStruct(codec.String);
+    val.sink_id = decoder.decodeStruct(codec.String);
+    val.original_presentation_id = decoder.decodeStruct(codec.String);
+    val.origin = decoder.decodeStructPointer(origin$.Origin);
+    val.tab_id = decoder.decodeStruct(codec.Int32);
+    packed = decoder.readUint8();
+    val.incognito = (packed >> 0) & 1 ? true : false;
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    val.timeout = decoder.decodeStructPointer(time$.TimeDelta);
+    return val;
+  };
+
+  MediaRouteProvider_CreateRoute_Params.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaRouteProvider_CreateRoute_Params.encodedSize);
+    encoder.writeUint32(0);
+    encoder.encodeStruct(codec.String, val.media_source);
+    encoder.encodeStruct(codec.String, val.sink_id);
+    encoder.encodeStruct(codec.String, val.original_presentation_id);
+    encoder.encodeStructPointer(origin$.Origin, val.origin);
+    encoder.encodeStruct(codec.Int32, val.tab_id);
+    packed = 0;
+    packed |= (val.incognito & 1) << 0
+    encoder.writeUint8(packed);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.encodeStructPointer(time$.TimeDelta, val.timeout);
+  };
+  function MediaRouteProvider_CreateRoute_ResponseParams(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaRouteProvider_CreateRoute_ResponseParams.prototype.initDefaults_ = function() {
+    this.route = null;
+    this.error_text = null;
+    this.result_code = 0;
+  };
+  MediaRouteProvider_CreateRoute_ResponseParams.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaRouteProvider_CreateRoute_ResponseParams.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 32}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_CreateRoute_ResponseParams.route
+    err = messageValidator.validateStructPointer(offset + codec.kStructHeaderSize + 0, MediaRoute, true);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_CreateRoute_ResponseParams.error_text
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 8, true)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_CreateRoute_ResponseParams.result_code
+    err = messageValidator.validateEnum(offset + codec.kStructHeaderSize + 16, RouteRequestResultCode);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    return validator.validationError.NONE;
+  };
+
+  MediaRouteProvider_CreateRoute_ResponseParams.encodedSize = codec.kStructHeaderSize + 24;
+
+  MediaRouteProvider_CreateRoute_ResponseParams.decode = function(decoder) {
+    var packed;
+    var val = new MediaRouteProvider_CreateRoute_ResponseParams();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    val.route = decoder.decodeStructPointer(MediaRoute);
+    val.error_text = decoder.decodeStruct(codec.NullableString);
+    val.result_code = decoder.decodeStruct(codec.Int32);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    return val;
+  };
+
+  MediaRouteProvider_CreateRoute_ResponseParams.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaRouteProvider_CreateRoute_ResponseParams.encodedSize);
+    encoder.writeUint32(0);
+    encoder.encodeStructPointer(MediaRoute, val.route);
+    encoder.encodeStruct(codec.NullableString, val.error_text);
+    encoder.encodeStruct(codec.Int32, val.result_code);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+  };
+  function MediaRouteProvider_JoinRoute_Params(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaRouteProvider_JoinRoute_Params.prototype.initDefaults_ = function() {
+    this.media_source = null;
+    this.presentation_id = null;
+    this.origin = null;
+    this.tab_id = 0;
+    this.incognito = false;
+    this.timeout = null;
+  };
+  MediaRouteProvider_JoinRoute_Params.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaRouteProvider_JoinRoute_Params.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 48}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_JoinRoute_Params.media_source
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 0, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_JoinRoute_Params.presentation_id
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 8, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_JoinRoute_Params.origin
+    err = messageValidator.validateStructPointer(offset + codec.kStructHeaderSize + 16, origin$.Origin, false);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+
+    
+    // validate MediaRouteProvider_JoinRoute_Params.timeout
+    err = messageValidator.validateStructPointer(offset + codec.kStructHeaderSize + 32, time$.TimeDelta, false);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    return validator.validationError.NONE;
+  };
+
+  MediaRouteProvider_JoinRoute_Params.encodedSize = codec.kStructHeaderSize + 40;
+
+  MediaRouteProvider_JoinRoute_Params.decode = function(decoder) {
+    var packed;
+    var val = new MediaRouteProvider_JoinRoute_Params();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    val.media_source = decoder.decodeStruct(codec.String);
+    val.presentation_id = decoder.decodeStruct(codec.String);
+    val.origin = decoder.decodeStructPointer(origin$.Origin);
+    val.tab_id = decoder.decodeStruct(codec.Int32);
+    packed = decoder.readUint8();
+    val.incognito = (packed >> 0) & 1 ? true : false;
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    val.timeout = decoder.decodeStructPointer(time$.TimeDelta);
+    return val;
+  };
+
+  MediaRouteProvider_JoinRoute_Params.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaRouteProvider_JoinRoute_Params.encodedSize);
+    encoder.writeUint32(0);
+    encoder.encodeStruct(codec.String, val.media_source);
+    encoder.encodeStruct(codec.String, val.presentation_id);
+    encoder.encodeStructPointer(origin$.Origin, val.origin);
+    encoder.encodeStruct(codec.Int32, val.tab_id);
+    packed = 0;
+    packed |= (val.incognito & 1) << 0
+    encoder.writeUint8(packed);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.encodeStructPointer(time$.TimeDelta, val.timeout);
+  };
+  function MediaRouteProvider_JoinRoute_ResponseParams(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaRouteProvider_JoinRoute_ResponseParams.prototype.initDefaults_ = function() {
+    this.route = null;
+    this.error_text = null;
+    this.result_code = 0;
+  };
+  MediaRouteProvider_JoinRoute_ResponseParams.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaRouteProvider_JoinRoute_ResponseParams.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 32}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_JoinRoute_ResponseParams.route
+    err = messageValidator.validateStructPointer(offset + codec.kStructHeaderSize + 0, MediaRoute, true);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_JoinRoute_ResponseParams.error_text
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 8, true)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_JoinRoute_ResponseParams.result_code
+    err = messageValidator.validateEnum(offset + codec.kStructHeaderSize + 16, RouteRequestResultCode);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    return validator.validationError.NONE;
+  };
+
+  MediaRouteProvider_JoinRoute_ResponseParams.encodedSize = codec.kStructHeaderSize + 24;
+
+  MediaRouteProvider_JoinRoute_ResponseParams.decode = function(decoder) {
+    var packed;
+    var val = new MediaRouteProvider_JoinRoute_ResponseParams();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    val.route = decoder.decodeStructPointer(MediaRoute);
+    val.error_text = decoder.decodeStruct(codec.NullableString);
+    val.result_code = decoder.decodeStruct(codec.Int32);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    return val;
+  };
+
+  MediaRouteProvider_JoinRoute_ResponseParams.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaRouteProvider_JoinRoute_ResponseParams.encodedSize);
+    encoder.writeUint32(0);
+    encoder.encodeStructPointer(MediaRoute, val.route);
+    encoder.encodeStruct(codec.NullableString, val.error_text);
+    encoder.encodeStruct(codec.Int32, val.result_code);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+  };
+  function MediaRouteProvider_ConnectRouteByRouteId_Params(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaRouteProvider_ConnectRouteByRouteId_Params.prototype.initDefaults_ = function() {
+    this.media_source = null;
+    this.route_id = null;
+    this.presentation_id = null;
+    this.origin = null;
+    this.tab_id = 0;
+    this.incognito = false;
+    this.timeout = null;
+  };
+  MediaRouteProvider_ConnectRouteByRouteId_Params.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaRouteProvider_ConnectRouteByRouteId_Params.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 56}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_ConnectRouteByRouteId_Params.media_source
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 0, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_ConnectRouteByRouteId_Params.route_id
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 8, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_ConnectRouteByRouteId_Params.presentation_id
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 16, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_ConnectRouteByRouteId_Params.origin
+    err = messageValidator.validateStructPointer(offset + codec.kStructHeaderSize + 24, origin$.Origin, false);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+
+    
+    // validate MediaRouteProvider_ConnectRouteByRouteId_Params.timeout
+    err = messageValidator.validateStructPointer(offset + codec.kStructHeaderSize + 40, time$.TimeDelta, false);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    return validator.validationError.NONE;
+  };
+
+  MediaRouteProvider_ConnectRouteByRouteId_Params.encodedSize = codec.kStructHeaderSize + 48;
+
+  MediaRouteProvider_ConnectRouteByRouteId_Params.decode = function(decoder) {
+    var packed;
+    var val = new MediaRouteProvider_ConnectRouteByRouteId_Params();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    val.media_source = decoder.decodeStruct(codec.String);
+    val.route_id = decoder.decodeStruct(codec.String);
+    val.presentation_id = decoder.decodeStruct(codec.String);
+    val.origin = decoder.decodeStructPointer(origin$.Origin);
+    val.tab_id = decoder.decodeStruct(codec.Int32);
+    packed = decoder.readUint8();
+    val.incognito = (packed >> 0) & 1 ? true : false;
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    val.timeout = decoder.decodeStructPointer(time$.TimeDelta);
+    return val;
+  };
+
+  MediaRouteProvider_ConnectRouteByRouteId_Params.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaRouteProvider_ConnectRouteByRouteId_Params.encodedSize);
+    encoder.writeUint32(0);
+    encoder.encodeStruct(codec.String, val.media_source);
+    encoder.encodeStruct(codec.String, val.route_id);
+    encoder.encodeStruct(codec.String, val.presentation_id);
+    encoder.encodeStructPointer(origin$.Origin, val.origin);
+    encoder.encodeStruct(codec.Int32, val.tab_id);
+    packed = 0;
+    packed |= (val.incognito & 1) << 0
+    encoder.writeUint8(packed);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.encodeStructPointer(time$.TimeDelta, val.timeout);
+  };
+  function MediaRouteProvider_ConnectRouteByRouteId_ResponseParams(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaRouteProvider_ConnectRouteByRouteId_ResponseParams.prototype.initDefaults_ = function() {
+    this.route = null;
+    this.error_text = null;
+    this.result_code = 0;
+  };
+  MediaRouteProvider_ConnectRouteByRouteId_ResponseParams.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaRouteProvider_ConnectRouteByRouteId_ResponseParams.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 32}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_ConnectRouteByRouteId_ResponseParams.route
+    err = messageValidator.validateStructPointer(offset + codec.kStructHeaderSize + 0, MediaRoute, true);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_ConnectRouteByRouteId_ResponseParams.error_text
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 8, true)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_ConnectRouteByRouteId_ResponseParams.result_code
+    err = messageValidator.validateEnum(offset + codec.kStructHeaderSize + 16, RouteRequestResultCode);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    return validator.validationError.NONE;
+  };
+
+  MediaRouteProvider_ConnectRouteByRouteId_ResponseParams.encodedSize = codec.kStructHeaderSize + 24;
+
+  MediaRouteProvider_ConnectRouteByRouteId_ResponseParams.decode = function(decoder) {
+    var packed;
+    var val = new MediaRouteProvider_ConnectRouteByRouteId_ResponseParams();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    val.route = decoder.decodeStructPointer(MediaRoute);
+    val.error_text = decoder.decodeStruct(codec.NullableString);
+    val.result_code = decoder.decodeStruct(codec.Int32);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    return val;
+  };
+
+  MediaRouteProvider_ConnectRouteByRouteId_ResponseParams.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaRouteProvider_ConnectRouteByRouteId_ResponseParams.encodedSize);
+    encoder.writeUint32(0);
+    encoder.encodeStructPointer(MediaRoute, val.route);
+    encoder.encodeStruct(codec.NullableString, val.error_text);
+    encoder.encodeStruct(codec.Int32, val.result_code);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+  };
+  function MediaRouteProvider_TerminateRoute_Params(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaRouteProvider_TerminateRoute_Params.prototype.initDefaults_ = function() {
+    this.route_id = null;
+  };
+  MediaRouteProvider_TerminateRoute_Params.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaRouteProvider_TerminateRoute_Params.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 16}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_TerminateRoute_Params.route_id
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 0, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    return validator.validationError.NONE;
+  };
+
+  MediaRouteProvider_TerminateRoute_Params.encodedSize = codec.kStructHeaderSize + 8;
+
+  MediaRouteProvider_TerminateRoute_Params.decode = function(decoder) {
+    var packed;
+    var val = new MediaRouteProvider_TerminateRoute_Params();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    val.route_id = decoder.decodeStruct(codec.String);
+    return val;
+  };
+
+  MediaRouteProvider_TerminateRoute_Params.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaRouteProvider_TerminateRoute_Params.encodedSize);
+    encoder.writeUint32(0);
+    encoder.encodeStruct(codec.String, val.route_id);
+  };
+  function MediaRouteProvider_TerminateRoute_ResponseParams(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaRouteProvider_TerminateRoute_ResponseParams.prototype.initDefaults_ = function() {
+    this.error_text = null;
+    this.result_code = 0;
+  };
+  MediaRouteProvider_TerminateRoute_ResponseParams.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaRouteProvider_TerminateRoute_ResponseParams.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 24}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_TerminateRoute_ResponseParams.error_text
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 0, true)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_TerminateRoute_ResponseParams.result_code
+    err = messageValidator.validateEnum(offset + codec.kStructHeaderSize + 8, RouteRequestResultCode);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    return validator.validationError.NONE;
+  };
+
+  MediaRouteProvider_TerminateRoute_ResponseParams.encodedSize = codec.kStructHeaderSize + 16;
+
+  MediaRouteProvider_TerminateRoute_ResponseParams.decode = function(decoder) {
+    var packed;
+    var val = new MediaRouteProvider_TerminateRoute_ResponseParams();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    val.error_text = decoder.decodeStruct(codec.NullableString);
+    val.result_code = decoder.decodeStruct(codec.Int32);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    return val;
+  };
+
+  MediaRouteProvider_TerminateRoute_ResponseParams.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaRouteProvider_TerminateRoute_ResponseParams.encodedSize);
+    encoder.writeUint32(0);
+    encoder.encodeStruct(codec.NullableString, val.error_text);
+    encoder.encodeStruct(codec.Int32, val.result_code);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+  };
+  function MediaRouteProvider_SendRouteMessage_Params(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaRouteProvider_SendRouteMessage_Params.prototype.initDefaults_ = function() {
+    this.media_route_id = null;
+    this.message = null;
+  };
+  MediaRouteProvider_SendRouteMessage_Params.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaRouteProvider_SendRouteMessage_Params.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 24}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_SendRouteMessage_Params.media_route_id
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 0, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_SendRouteMessage_Params.message
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 8, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    return validator.validationError.NONE;
+  };
+
+  MediaRouteProvider_SendRouteMessage_Params.encodedSize = codec.kStructHeaderSize + 16;
+
+  MediaRouteProvider_SendRouteMessage_Params.decode = function(decoder) {
+    var packed;
+    var val = new MediaRouteProvider_SendRouteMessage_Params();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    val.media_route_id = decoder.decodeStruct(codec.String);
+    val.message = decoder.decodeStruct(codec.String);
+    return val;
+  };
+
+  MediaRouteProvider_SendRouteMessage_Params.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaRouteProvider_SendRouteMessage_Params.encodedSize);
+    encoder.writeUint32(0);
+    encoder.encodeStruct(codec.String, val.media_route_id);
+    encoder.encodeStruct(codec.String, val.message);
+  };
+  function MediaRouteProvider_SendRouteMessage_ResponseParams(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaRouteProvider_SendRouteMessage_ResponseParams.prototype.initDefaults_ = function() {
+    this.sent = false;
+  };
+  MediaRouteProvider_SendRouteMessage_ResponseParams.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaRouteProvider_SendRouteMessage_ResponseParams.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 16}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    return validator.validationError.NONE;
+  };
+
+  MediaRouteProvider_SendRouteMessage_ResponseParams.encodedSize = codec.kStructHeaderSize + 8;
+
+  MediaRouteProvider_SendRouteMessage_ResponseParams.decode = function(decoder) {
+    var packed;
+    var val = new MediaRouteProvider_SendRouteMessage_ResponseParams();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    packed = decoder.readUint8();
+    val.sent = (packed >> 0) & 1 ? true : false;
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    return val;
+  };
+
+  MediaRouteProvider_SendRouteMessage_ResponseParams.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaRouteProvider_SendRouteMessage_ResponseParams.encodedSize);
+    encoder.writeUint32(0);
+    packed = 0;
+    packed |= (val.sent & 1) << 0
+    encoder.writeUint8(packed);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+  };
+  function MediaRouteProvider_SendRouteBinaryMessage_Params(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaRouteProvider_SendRouteBinaryMessage_Params.prototype.initDefaults_ = function() {
+    this.media_route_id = null;
+    this.data = null;
+  };
+  MediaRouteProvider_SendRouteBinaryMessage_Params.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaRouteProvider_SendRouteBinaryMessage_Params.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 24}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_SendRouteBinaryMessage_Params.media_route_id
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 0, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_SendRouteBinaryMessage_Params.data
+    err = messageValidator.validateArrayPointer(offset + codec.kStructHeaderSize + 8, 1, codec.Uint8, false, [0], 0);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    return validator.validationError.NONE;
+  };
+
+  MediaRouteProvider_SendRouteBinaryMessage_Params.encodedSize = codec.kStructHeaderSize + 16;
+
+  MediaRouteProvider_SendRouteBinaryMessage_Params.decode = function(decoder) {
+    var packed;
+    var val = new MediaRouteProvider_SendRouteBinaryMessage_Params();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    val.media_route_id = decoder.decodeStruct(codec.String);
+    val.data = decoder.decodeArrayPointer(codec.Uint8);
+    return val;
+  };
+
+  MediaRouteProvider_SendRouteBinaryMessage_Params.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaRouteProvider_SendRouteBinaryMessage_Params.encodedSize);
+    encoder.writeUint32(0);
+    encoder.encodeStruct(codec.String, val.media_route_id);
+    encoder.encodeArrayPointer(codec.Uint8, val.data);
+  };
+  function MediaRouteProvider_SendRouteBinaryMessage_ResponseParams(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaRouteProvider_SendRouteBinaryMessage_ResponseParams.prototype.initDefaults_ = function() {
+    this.sent = false;
+  };
+  MediaRouteProvider_SendRouteBinaryMessage_ResponseParams.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaRouteProvider_SendRouteBinaryMessage_ResponseParams.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 16}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    return validator.validationError.NONE;
+  };
+
+  MediaRouteProvider_SendRouteBinaryMessage_ResponseParams.encodedSize = codec.kStructHeaderSize + 8;
+
+  MediaRouteProvider_SendRouteBinaryMessage_ResponseParams.decode = function(decoder) {
+    var packed;
+    var val = new MediaRouteProvider_SendRouteBinaryMessage_ResponseParams();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    packed = decoder.readUint8();
+    val.sent = (packed >> 0) & 1 ? true : false;
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    decoder.skip(1);
+    return val;
+  };
+
+  MediaRouteProvider_SendRouteBinaryMessage_ResponseParams.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaRouteProvider_SendRouteBinaryMessage_ResponseParams.encodedSize);
+    encoder.writeUint32(0);
+    packed = 0;
+    packed |= (val.sent & 1) << 0
+    encoder.writeUint8(packed);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+    encoder.skip(1);
+  };
+  function MediaRouteProvider_StartObservingMediaSinks_Params(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaRouteProvider_StartObservingMediaSinks_Params.prototype.initDefaults_ = function() {
+    this.media_source = null;
+  };
+  MediaRouteProvider_StartObservingMediaSinks_Params.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaRouteProvider_StartObservingMediaSinks_Params.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 16}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_StartObservingMediaSinks_Params.media_source
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 0, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    return validator.validationError.NONE;
+  };
+
+  MediaRouteProvider_StartObservingMediaSinks_Params.encodedSize = codec.kStructHeaderSize + 8;
+
+  MediaRouteProvider_StartObservingMediaSinks_Params.decode = function(decoder) {
+    var packed;
+    var val = new MediaRouteProvider_StartObservingMediaSinks_Params();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    val.media_source = decoder.decodeStruct(codec.String);
+    return val;
+  };
+
+  MediaRouteProvider_StartObservingMediaSinks_Params.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaRouteProvider_StartObservingMediaSinks_Params.encodedSize);
+    encoder.writeUint32(0);
+    encoder.encodeStruct(codec.String, val.media_source);
+  };
+  function MediaRouteProvider_StopObservingMediaSinks_Params(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaRouteProvider_StopObservingMediaSinks_Params.prototype.initDefaults_ = function() {
+    this.media_source = null;
+  };
+  MediaRouteProvider_StopObservingMediaSinks_Params.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaRouteProvider_StopObservingMediaSinks_Params.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 16}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_StopObservingMediaSinks_Params.media_source
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 0, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    return validator.validationError.NONE;
+  };
+
+  MediaRouteProvider_StopObservingMediaSinks_Params.encodedSize = codec.kStructHeaderSize + 8;
+
+  MediaRouteProvider_StopObservingMediaSinks_Params.decode = function(decoder) {
+    var packed;
+    var val = new MediaRouteProvider_StopObservingMediaSinks_Params();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    val.media_source = decoder.decodeStruct(codec.String);
+    return val;
+  };
+
+  MediaRouteProvider_StopObservingMediaSinks_Params.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaRouteProvider_StopObservingMediaSinks_Params.encodedSize);
+    encoder.writeUint32(0);
+    encoder.encodeStruct(codec.String, val.media_source);
+  };
+  function MediaRouteProvider_StartObservingMediaRoutes_Params(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaRouteProvider_StartObservingMediaRoutes_Params.prototype.initDefaults_ = function() {
+    this.media_source = null;
+  };
+  MediaRouteProvider_StartObservingMediaRoutes_Params.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaRouteProvider_StartObservingMediaRoutes_Params.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 16}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_StartObservingMediaRoutes_Params.media_source
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 0, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    return validator.validationError.NONE;
+  };
+
+  MediaRouteProvider_StartObservingMediaRoutes_Params.encodedSize = codec.kStructHeaderSize + 8;
+
+  MediaRouteProvider_StartObservingMediaRoutes_Params.decode = function(decoder) {
+    var packed;
+    var val = new MediaRouteProvider_StartObservingMediaRoutes_Params();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    val.media_source = decoder.decodeStruct(codec.String);
+    return val;
+  };
+
+  MediaRouteProvider_StartObservingMediaRoutes_Params.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaRouteProvider_StartObservingMediaRoutes_Params.encodedSize);
+    encoder.writeUint32(0);
+    encoder.encodeStruct(codec.String, val.media_source);
+  };
+  function MediaRouteProvider_StopObservingMediaRoutes_Params(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaRouteProvider_StopObservingMediaRoutes_Params.prototype.initDefaults_ = function() {
+    this.media_source = null;
+  };
+  MediaRouteProvider_StopObservingMediaRoutes_Params.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaRouteProvider_StopObservingMediaRoutes_Params.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 16}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_StopObservingMediaRoutes_Params.media_source
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 0, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    return validator.validationError.NONE;
+  };
+
+  MediaRouteProvider_StopObservingMediaRoutes_Params.encodedSize = codec.kStructHeaderSize + 8;
+
+  MediaRouteProvider_StopObservingMediaRoutes_Params.decode = function(decoder) {
+    var packed;
+    var val = new MediaRouteProvider_StopObservingMediaRoutes_Params();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    val.media_source = decoder.decodeStruct(codec.String);
+    return val;
+  };
+
+  MediaRouteProvider_StopObservingMediaRoutes_Params.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaRouteProvider_StopObservingMediaRoutes_Params.encodedSize);
+    encoder.writeUint32(0);
+    encoder.encodeStruct(codec.String, val.media_source);
+  };
+  function MediaRouteProvider_StartListeningForRouteMessages_Params(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaRouteProvider_StartListeningForRouteMessages_Params.prototype.initDefaults_ = function() {
+    this.route_id = null;
+  };
+  MediaRouteProvider_StartListeningForRouteMessages_Params.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaRouteProvider_StartListeningForRouteMessages_Params.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 16}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_StartListeningForRouteMessages_Params.route_id
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 0, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    return validator.validationError.NONE;
+  };
+
+  MediaRouteProvider_StartListeningForRouteMessages_Params.encodedSize = codec.kStructHeaderSize + 8;
+
+  MediaRouteProvider_StartListeningForRouteMessages_Params.decode = function(decoder) {
+    var packed;
+    var val = new MediaRouteProvider_StartListeningForRouteMessages_Params();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    val.route_id = decoder.decodeStruct(codec.String);
+    return val;
+  };
+
+  MediaRouteProvider_StartListeningForRouteMessages_Params.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaRouteProvider_StartListeningForRouteMessages_Params.encodedSize);
+    encoder.writeUint32(0);
+    encoder.encodeStruct(codec.String, val.route_id);
+  };
+  function MediaRouteProvider_StopListeningForRouteMessages_Params(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaRouteProvider_StopListeningForRouteMessages_Params.prototype.initDefaults_ = function() {
+    this.route_id = null;
+  };
+  MediaRouteProvider_StopListeningForRouteMessages_Params.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaRouteProvider_StopListeningForRouteMessages_Params.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 16}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_StopListeningForRouteMessages_Params.route_id
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 0, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    return validator.validationError.NONE;
+  };
+
+  MediaRouteProvider_StopListeningForRouteMessages_Params.encodedSize = codec.kStructHeaderSize + 8;
+
+  MediaRouteProvider_StopListeningForRouteMessages_Params.decode = function(decoder) {
+    var packed;
+    var val = new MediaRouteProvider_StopListeningForRouteMessages_Params();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    val.route_id = decoder.decodeStruct(codec.String);
+    return val;
+  };
+
+  MediaRouteProvider_StopListeningForRouteMessages_Params.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaRouteProvider_StopListeningForRouteMessages_Params.encodedSize);
+    encoder.writeUint32(0);
+    encoder.encodeStruct(codec.String, val.route_id);
+  };
+  function MediaRouteProvider_DetachRoute_Params(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaRouteProvider_DetachRoute_Params.prototype.initDefaults_ = function() {
+    this.route_id = null;
+  };
+  MediaRouteProvider_DetachRoute_Params.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaRouteProvider_DetachRoute_Params.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 16}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_DetachRoute_Params.route_id
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 0, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    return validator.validationError.NONE;
+  };
+
+  MediaRouteProvider_DetachRoute_Params.encodedSize = codec.kStructHeaderSize + 8;
+
+  MediaRouteProvider_DetachRoute_Params.decode = function(decoder) {
+    var packed;
+    var val = new MediaRouteProvider_DetachRoute_Params();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    val.route_id = decoder.decodeStruct(codec.String);
+    return val;
+  };
+
+  MediaRouteProvider_DetachRoute_Params.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaRouteProvider_DetachRoute_Params.encodedSize);
+    encoder.writeUint32(0);
+    encoder.encodeStruct(codec.String, val.route_id);
+  };
+  function MediaRouteProvider_EnableMdnsDiscovery_Params(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaRouteProvider_EnableMdnsDiscovery_Params.prototype.initDefaults_ = function() {
+  };
+  MediaRouteProvider_EnableMdnsDiscovery_Params.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaRouteProvider_EnableMdnsDiscovery_Params.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 8}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    return validator.validationError.NONE;
+  };
+
+  MediaRouteProvider_EnableMdnsDiscovery_Params.encodedSize = codec.kStructHeaderSize + 0;
+
+  MediaRouteProvider_EnableMdnsDiscovery_Params.decode = function(decoder) {
+    var packed;
+    var val = new MediaRouteProvider_EnableMdnsDiscovery_Params();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    return val;
+  };
+
+  MediaRouteProvider_EnableMdnsDiscovery_Params.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaRouteProvider_EnableMdnsDiscovery_Params.encodedSize);
+    encoder.writeUint32(0);
+  };
+  function MediaRouteProvider_UpdateMediaSinks_Params(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaRouteProvider_UpdateMediaSinks_Params.prototype.initDefaults_ = function() {
+    this.media_source = null;
+  };
+  MediaRouteProvider_UpdateMediaSinks_Params.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaRouteProvider_UpdateMediaSinks_Params.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 16}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_UpdateMediaSinks_Params.media_source
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 0, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    return validator.validationError.NONE;
+  };
+
+  MediaRouteProvider_UpdateMediaSinks_Params.encodedSize = codec.kStructHeaderSize + 8;
+
+  MediaRouteProvider_UpdateMediaSinks_Params.decode = function(decoder) {
+    var packed;
+    var val = new MediaRouteProvider_UpdateMediaSinks_Params();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    val.media_source = decoder.decodeStruct(codec.String);
+    return val;
+  };
+
+  MediaRouteProvider_UpdateMediaSinks_Params.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaRouteProvider_UpdateMediaSinks_Params.encodedSize);
+    encoder.writeUint32(0);
+    encoder.encodeStruct(codec.String, val.media_source);
+  };
+  function MediaRouteProvider_SearchSinks_Params(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaRouteProvider_SearchSinks_Params.prototype.initDefaults_ = function() {
+    this.sink_id = null;
+    this.media_source = null;
+    this.search_criteria = null;
+  };
+  MediaRouteProvider_SearchSinks_Params.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaRouteProvider_SearchSinks_Params.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 32}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_SearchSinks_Params.sink_id
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 0, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_SearchSinks_Params.media_source
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 8, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_SearchSinks_Params.search_criteria
+    err = messageValidator.validateStructPointer(offset + codec.kStructHeaderSize + 16, SinkSearchCriteria, false);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    return validator.validationError.NONE;
+  };
+
+  MediaRouteProvider_SearchSinks_Params.encodedSize = codec.kStructHeaderSize + 24;
+
+  MediaRouteProvider_SearchSinks_Params.decode = function(decoder) {
+    var packed;
+    var val = new MediaRouteProvider_SearchSinks_Params();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    val.sink_id = decoder.decodeStruct(codec.String);
+    val.media_source = decoder.decodeStruct(codec.String);
+    val.search_criteria = decoder.decodeStructPointer(SinkSearchCriteria);
+    return val;
+  };
+
+  MediaRouteProvider_SearchSinks_Params.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaRouteProvider_SearchSinks_Params.encodedSize);
+    encoder.writeUint32(0);
+    encoder.encodeStruct(codec.String, val.sink_id);
+    encoder.encodeStruct(codec.String, val.media_source);
+    encoder.encodeStructPointer(SinkSearchCriteria, val.search_criteria);
+  };
+  function MediaRouteProvider_SearchSinks_ResponseParams(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaRouteProvider_SearchSinks_ResponseParams.prototype.initDefaults_ = function() {
+    this.sink_id = null;
+  };
+  MediaRouteProvider_SearchSinks_ResponseParams.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaRouteProvider_SearchSinks_ResponseParams.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 16}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_SearchSinks_ResponseParams.sink_id
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 0, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    return validator.validationError.NONE;
+  };
+
+  MediaRouteProvider_SearchSinks_ResponseParams.encodedSize = codec.kStructHeaderSize + 8;
+
+  MediaRouteProvider_SearchSinks_ResponseParams.decode = function(decoder) {
+    var packed;
+    var val = new MediaRouteProvider_SearchSinks_ResponseParams();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    val.sink_id = decoder.decodeStruct(codec.String);
+    return val;
+  };
+
+  MediaRouteProvider_SearchSinks_ResponseParams.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaRouteProvider_SearchSinks_ResponseParams.encodedSize);
+    encoder.writeUint32(0);
+    encoder.encodeStruct(codec.String, val.sink_id);
+  };
+  function MediaRouteProvider_ProvideSinks_Params(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaRouteProvider_ProvideSinks_Params.prototype.initDefaults_ = function() {
+    this.provider_name = null;
+    this.sinks = null;
+  };
+  MediaRouteProvider_ProvideSinks_Params.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaRouteProvider_ProvideSinks_Params.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 24}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_ProvideSinks_Params.provider_name
+    err = messageValidator.validateStringPointer(offset + codec.kStructHeaderSize + 0, false)
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouteProvider_ProvideSinks_Params.sinks
+    err = messageValidator.validateArrayPointer(offset + codec.kStructHeaderSize + 8, 8, new codec.PointerTo(MediaSink), false, [0], 0);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    return validator.validationError.NONE;
+  };
+
+  MediaRouteProvider_ProvideSinks_Params.encodedSize = codec.kStructHeaderSize + 16;
+
+  MediaRouteProvider_ProvideSinks_Params.decode = function(decoder) {
+    var packed;
+    var val = new MediaRouteProvider_ProvideSinks_Params();
+    var numberOfBytes = decoder.readUint32();
+    var version = decoder.readUint32();
+    val.provider_name = decoder.decodeStruct(codec.String);
+    val.sinks = decoder.decodeArrayPointer(new codec.PointerTo(MediaSink));
+    return val;
+  };
+
+  MediaRouteProvider_ProvideSinks_Params.encode = function(encoder, val) {
+    var packed;
+    encoder.writeUint32(MediaRouteProvider_ProvideSinks_Params.encodedSize);
+    encoder.writeUint32(0);
+    encoder.encodeStruct(codec.String, val.provider_name);
+    encoder.encodeArrayPointer(new codec.PointerTo(MediaSink), val.sinks);
+  };
+  function MediaRouter_RegisterMediaRouteProvider_Params(values) {
+    this.initDefaults_();
+    this.initFields_(values);
+  }
+
+
+  MediaRouter_RegisterMediaRouteProvider_Params.prototype.initDefaults_ = function() {
+    this.media_router_provider = new MediaRouteProviderPtr();
+  };
+  MediaRouter_RegisterMediaRouteProvider_Params.prototype.initFields_ = function(fields) {
+    for(var field in fields) {
+        if (this.hasOwnProperty(field))
+          this[field] = fields[field];
+    }
+  };
+
+  MediaRouter_RegisterMediaRouteProvider_Params.validate = function(messageValidator, offset) {
+    var err;
+    err = messageValidator.validateStructHeader(offset, codec.kStructHeaderSize);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+    var kVersionSizes = [
+      {version: 0, numBytes: 16}
+    ];
+    err = messageValidator.validateStructVersion(offset, kVersionSizes);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+
+    
+    // validate MediaRouter_RegisterMediaRouteProvider_Params.media_router_provider
+    err = messageValidator.validateInterface(offset + codec.kStructHeaderSize + 0, false);
+    if (err !== validator.validationError.NONE)
+        return err;
+
+ 
